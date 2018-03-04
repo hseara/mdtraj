@@ -29,6 +29,7 @@ from __future__ import print_function, division
 import numpy as np
 from mdtraj.utils import ensure_type
 from mdtraj.geometry import _geometry, distance
+import warnings
 
 __all__ = ['compute_angles']
 
@@ -44,7 +45,7 @@ def compute_angles(traj, angle_indices, periodic=True, opt=True):
     ----------
     traj : Trajectory
         An mdtraj trajectory.
-    angle_indices : np.ndarray, shape=(num_pairs, 2), dtype=int
+    angle_indices : np.ndarray, shape=(num_angles, 3), dtype=int
        Each row gives the indices of three atoms which together make an angle.
     periodic : bool, default=True
         If `periodic` is True and the trajectory contains unitcell
@@ -72,7 +73,8 @@ def compute_angles(traj, angle_indices, periodic=True, opt=True):
     if periodic is True and traj._have_unitcell:
         box = ensure_type(traj.unitcell_vectors, dtype=np.float32, ndim=3, name='unitcell_vectors', shape=(len(xyz), 3, 3))
         if opt:
-            _geometry._angle_mic(xyz, triplets, box, out)
+            orthogonal = np.allclose(traj.unitcell_angles, 90)
+            _geometry._angle_mic(xyz, triplets, box.transpose(0, 2, 1).copy(), out, orthogonal)
             return out
         else:
             _angle(traj, triplets, periodic, out)

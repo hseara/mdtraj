@@ -1,30 +1,53 @@
 language: c
+sudo: false
+
+addons:
+  apt:
+    packages:
+      # SPARTA+ requires csh
+      - csh
 
 install:
-  - source devtools/travis-ci/install.sh
-  - export PYTHONUNBUFFERED=true
-  - export CC=gcc
-  - export CXX=g++
+  - if [[ "$TRAVIS_OS_NAME" == "osx" ]]; then brew update && brew install md5sha1sum; fi
+  - source devtools/travis-ci/install_miniconda.sh
+  - source devtools/travis-ci/install_sparta.sh
+  - source devtools/travis-ci/install_ppm.sh
+  - conda config --add channels omnia
+  - conda config --add channels conda-forge # hightest priority 
 
 script:
-  - conda config --add channels https://conda.binstar.org/omnia
-  - conda build devtools/conda-recipe
-  - #cd devtools/c-tests/; make valgrind; cd -
+  conda build --quiet devtools/conda-recipe
+  && devtools/travis-ci/build_docs.sh
+
+os:
+  - osx
+  - linux
 
 env:
-  matrix:
-    - python=2.6  CONDA_PY=26  CONDA_NPY=16
-    - python=2.7  CONDA_PY=27  CONDA_NPY=16
-    - python=3.3  CONDA_PY=33  CONDA_NPY=17
-    - python=3.4  CONDA_PY=34  CONDA_NPY=18
+  - CONDA_PY=2.7 CONDA_NPY=1.7
+  - CONDA_PY=2.7
+  - CONDA_PY=3.5 CONDA_NPY=1.11
+  - CONDA_PY=3.6
 
-  global:
-    # encrypted AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY to push documentation to S3
-    - secure: "qrbibHwlbXBTq+8h1DC1plyUcl67qwn5yr4UYILdk9WsBhPdNT0ObpRUOcFDW/YM9RDfcOvx7Ruq/OPhvlVCg1C+Lj01kSx3vHxYCxFJVyN7iiD9oI/xzFUc6guvYF9O8um2+QE1ZI70yffGJGT7MZUQNUBnKchqvV3uIeSOqw4="
-    - secure: "Y4deQNbKXm0dTth0VoR59wEPYr0dNmp4Np+GDnJofwL+HKQ/w3dTrM3PQOV3bZ2w7WV2gAdtOv8MMUjdFYyyB+GS1wIZa4XbXchGNJr/lljvT3OP579ZwSLAowjEFFR6hidFDfMcR4D7KzTnoCIe9odXrZplI6l0M4OL1agki84="
-    # encrypted BINSTAR_TOKEN for push of dev package to binstar
-    - secure: "YdOr8FF3Vw8FzMUYDOB6NSuet3Vh2YxHw9Q1pRu5SsSv3hgLeWIf1wlWOwEHmxU03oLD6DVrqvhStmYWZHunsQqziwGIUuqLxGXC0/dM//ayzfNObU266Pyy50Xn7+/J6YpRSrmMF/GaQeJbq0c357cIMSYRHg8izSaFYPOXKjs="
+# Do include/exclude to add "DOCDEPLOY" to one matrix entry.
+matrix:
+  exclude:
+    - os: linux
+      env: CONDA_PY=3.6
+  include:
+    - os: linux
+      env: CONDA_PY=3.6 DOCDEPLOY=YES
 
-after_success:
-  - echo "after_success"
-  - source devtools/travis-ci/after_sucess.sh
+deploy:
+  - provider: s3
+    access_key_id:
+      secure: "W6YkOUOWIGXFP3YDkoGXh2M3bIS1/KYEy+EjPPOpeeX6MiTWkJz56ClV8kB+j+s1qPd+So3LUDXT4WW1qH2fftMlDSCnlwWPjtz45lSyOP7vOFeuLMm7hRWyDAPaQYumEN1rY7TlcB3YjC4AQKlPmILyKH7mGBWAgbumMs9pHtI="
+    secret_access_key:
+      secure: "ks3zwG//xUNMfAyFQSxJ/iD+fkO/VkMayGP/wZLpePJOWH3nZQkPeNhpk9xoq2jMUI8wNCY3jrQi0sj2NETReBq0WjVpx6H1UwnT3hu4NvwyW7256+RSRTWMzGBoLiClCKQ2Uu7guJKSvoRZim0p+LNSZqSf+c+P6FVs5QjlouA="
+    bucket: "mdtraj.org"
+    region: us-west-1
+    skip_cleanup: true
+    local_dir: docs/_deploy/
+    on:
+      branch: master
+      condition: "-n $DOCDEPLOY"

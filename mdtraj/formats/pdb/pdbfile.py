@@ -4,7 +4,7 @@
 # Copyright 2012-2013 Stanford University and the Authors
 #
 # Authors: Peter Eastman, Robert McGibbon
-# Contributors: Carlos Hernandez
+# Contributors: Carlos Hernandez, Jason Swails
 #
 # MDTraj is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License as
@@ -52,11 +52,12 @@ import xml.etree.ElementTree as etree
 from copy import copy
 from mdtraj.formats.pdb.pdbstructure import PdbStructure
 from mdtraj.core.topology import Topology
-from mdtraj.utils import ilen, cast_indices, in_units_of
-from mdtraj.formats.registry import _FormatRegistry
+from mdtraj.utils import ilen, cast_indices, in_units_of, open_maybe_zipped
+from mdtraj.formats.registry import FormatRegistry
 from mdtraj.core import element as elem
 from mdtraj.utils import six
 from mdtraj import version
+import warnings
 if six.PY3:
     from urllib.request import urlopen
     from urllib.parse import urlparse
@@ -65,6 +66,9 @@ else:
     from urllib2 import urlopen
     from urlparse import urlparse
     from urlparse import uses_relative, uses_netloc, uses_params
+    # Ugly hack -- we don't always issue UserWarning in Py2, but we need to in
+    # this module
+    warnings.filterwarnings('always', category=UserWarning, module=__name__)
 
 _VALID_URLS = set(uses_relative + uses_netloc + uses_params)
 _VALID_URLS.discard('')
@@ -83,13 +87,14 @@ def _is_url(url):
     """
     try:
         return urlparse(url).scheme in _VALID_URLS
-    except:
+    except (AttributeError, TypeError):
         return False
 
 
-@_FormatRegistry.register_loader('.pdb')
-@_FormatRegistry.register_loader('.pdb.gz')
-def load_pdb(filename, stride=None, atom_indices=None, frame=None):
+@FormatRegistry.register_loader('.pdb')
+@FormatRegistry.register_loader('.pdb.gz')
+def load_pdb(filename, stride=None, atom_indices=None, frame=None,
+             no_boxchk=False, standard_names=True ):
     """Load a RCSB Protein Data Bank file from disk.
 
     Parameters
@@ -99,15 +104,27 @@ def load_pdb(filename, stride=None, atom_indices=None, frame=None):
         schemes include http and ftp.
     stride : int, default=None
         Only read every stride-th model from the file
-    atom_indices : array_like, optional
-        If not none, then read only a subset of the atoms coordinates from the
+    atom_indices : array_like, default=None
+        If not None, then read only a subset of the atoms coordinates from the
         file. These indices are zero-based (not 1 based, as used by the PDB
         format). So if you want to load only the first atom in the file, you
         would supply ``atom_indices = np.array([0])``.
-    frame : int, optional
+    frame : int, default=None
         Use this option to load only a single frame from a trajectory on disk.
         If frame is None, the default, the entire trajectory will be loaded.
         If supplied, ``stride`` will be ignored.
+    no_boxchk : bool, default=False
+        By default, a heuristic check based on the particle density will be
+        performed to determine if the unit cell dimensions are absurd. If the
+        particle density is >1000 atoms per nm^3, the unit cell will be
+        discarded. This is done because all PDB files from RCSB contain a CRYST1
+        record, even if there are no periodic boundaries, and dummy values are
+        filled in instead. This check will filter out those false unit cells and
+        avoid potential errors in geometry calculations. Set this variable to
+        ``True`` in order to skip this heuristic check.
+    standard_names : bool, default=True
+        If True, non-standard atomnames and residuenames are standardized to conform 
+        with the current PDB format version. If set to false, this step is skipped.
 
     Returns
     -------
@@ -118,7 +135,7 @@ def load_pdb(filename, stride=None, atom_indices=None, frame=None):
     --------
     >>> import mdtraj as md
     >>> pdb = md.load_pdb('2EQQ.pdb')
-    >>> print pdb
+    >>> print(pdb)
     <mdtraj.Trajectory with 20 frames, 423 atoms at 0x110740a90>
 
     See Also
@@ -133,7 +150,7 @@ def load_pdb(filename, stride=None, atom_indices=None, frame=None):
     atom_indices = cast_indices(atom_indices)
     
     filename = str(filename)
-    with PDBTrajectoryFile(filename) as f:
+    with PDBTrajectoryFile(filename, standard_names=standard_names) as f:
         atom_slice = slice(None) if atom_indices is None else atom_indices
         if frame is not None:
             coords = f.positions[[frame], atom_slice, :]
@@ -162,12 +179,29 @@ def load_pdb(filename, stride=None, atom_indices=None, frame=None):
     elif stride is not None:
         time *= stride
 
-    return Trajectory(xyz=coords, time=time, topology=topology,
+    traj = Trajectory(xyz=coords, time=time, topology=topology,
                       unitcell_lengths=unitcell_lengths,
                       unitcell_angles=unitcell_angles)
 
+    if not no_boxchk and traj.unitcell_lengths is not None:
+        # Only one CRYST1 record is allowed, so only do this check for the first
+        # frame. Some RCSB PDB files do not *really* have a unit cell, but still
+        # have a CRYST1 record with a dummy definition. These boxes are usually
+        # tiny (e.g., 1 A^3), so check that the particle density in the unit
+        # cell is not absurdly high. Standard water density is ~55 M, which
+        # yields a particle density ~100 atoms per cubic nm. It should be safe
+        # to say that no particle density should exceed 10x that.
+        particle_density = traj.top.n_atoms / traj.unitcell_volumes[0]
+        if particle_density > 1000:
+            warnings.warn('Unlikely unit cell vectors detected in PDB file likely '
+                          'resulting from a dummy CRYST1 record. Discarding unit '
+                          'cell vectors.')
+            traj._unitcell_lengths = traj._unitcell_angles = None
 
-@_FormatRegistry.register_fileobject('.pdb')
+    return traj
+
+@FormatRegistry.register_fileobject('.pdb')
+@FormatRegistry.register_fileobject('.pdb.gz')
 class PDBTrajectoryFile(object):
     """Interface for reading and writing Protein Data Bank (PDB) files
 
@@ -180,6 +214,9 @@ class PDBTrajectoryFile(object):
     force_overwrite : bool
         If opened in write mode, and a file by the name of `filename` already
         exists on disk, should we overwrite it?
+    standard_names : bool, default=True
+        If True, non-standard atomnames and residuenames are standardized to conform 
+        with the current PDB format version. If set to false, this step is skipped.
 
     Attributes
     ----------
@@ -204,13 +241,14 @@ class PDBTrajectoryFile(object):
     _atomNameReplacements = {}
     _chain_names = [chr(ord('A') + i) for i in range(26)]
 
-    def __init__(self, filename, mode='r', force_overwrite=True):
+    def __init__(self, filename, mode='r', force_overwrite=True, standard_names=True):
         self._open = False
         self._file = None
         self._topology = None
         self._positions = None
         self._mode = mode
         self._last_topology = None
+        self._standard_names = standard_names
 
         if mode == 'r':
             PDBTrajectoryFile._loadNameReplacementTables()
@@ -226,19 +264,13 @@ class PDBTrajectoryFile(object):
                 if six.PY3:
                     self._file = six.StringIO(self._file.read().decode('utf-8'))
             else:
-                if filename.lower().endswith('.gz'):
-                    self._file = gzip.open(filename, 'r')
-                    self._file = six.StringIO(self._file.read().decode('utf-8'))                    
-                else:
-                    self._file = open(filename, 'r')
+                self._file = open_maybe_zipped(filename, 'r')
 
             self._read_models()
         elif mode == 'w':
             self._header_written = False
             self._footer_written = False
-            if os.path.exists(filename) and not force_overwrite:
-                raise IOError('"%s" already exists' % filename)
-            self._file = open(filename, 'w')
+            self._file = open_maybe_zipped(filename, 'w', force_overwrite)
         else:
             raise ValueError("invalid mode: %s" % mode)
 
@@ -312,11 +344,11 @@ class PDBTrajectoryFile(object):
                         symbol = atom.element.symbol
                     else:
                         symbol = ' '
-                    line = "ATOM  %5d %-4s %3s %s%4d    %s%s%s  1.00 %s          %2s  " % (
+                    line = "ATOM  %5d %-4s %3s %1s%4d    %s%s%s  1.00 %5s      %-4s%-2s  " % (
                         atomIndex % 100000, atomName, resName, chainName,
                         (res.resSeq) % 10000, _format_83(coords[0]),
                         _format_83(coords[1]), _format_83(coords[2]),
-                        bfactors[posIndex], symbol)
+                        bfactors[posIndex], atom.segment_id[:4], symbol[-2:])
                     assert len(line) == 80, 'Fixed width overflow detected'
                     print(line, file=self._file)
                     posIndex += 1
@@ -484,10 +516,10 @@ class PDBTrajectoryFile(object):
             c = self._topology.add_chain()
             for residue in chain.iter_residues():
                 resName = residue.get_name()
-                if resName in PDBTrajectoryFile._residueNameReplacements:
+                if resName in PDBTrajectoryFile._residueNameReplacements and self._standard_names:
                     resName = PDBTrajectoryFile._residueNameReplacements[resName]
-                r = self._topology.add_residue(resName, c, residue.number)
-                if resName in PDBTrajectoryFile._atomNameReplacements:
+                r = self._topology.add_residue(resName, c, residue.number, residue.segment_id)
+                if resName in PDBTrajectoryFile._atomNameReplacements and self._standard_names:
                     atomReplacements = PDBTrajectoryFile._atomNameReplacements[resName]
                 else:
                     atomReplacements = {}
@@ -498,7 +530,7 @@ class PDBTrajectoryFile(object):
                     atomName = atomName.strip()
                     element = atom.element
                     if element is None:
-                        element = self._guess_element(atomName, residue)
+                        element = PDBTrajectoryFile._guess_element(atomName, residue.name, len(residue))
 
                     newAtom = self._topology.add_atom(atomName, element, r, serial=atom.serial_number)
                     atomByNumber[atom.serial_number] = newAtom
@@ -526,7 +558,7 @@ class PDBTrajectoryFile(object):
 
         # Add bonds based on CONECT records.
         connectBonds = []
-        for connect in pdb.models[0].connects:
+        for connect in pdb.models[-1].connects:
             i = connect[0]
             for j in connect[1:]:
                 if i in atomByNumber and j in atomByNumber:
@@ -574,7 +606,8 @@ class PDBTrajectoryFile(object):
                 PDBTrajectoryFile._parseResidueAtoms(residue, atoms)
                 PDBTrajectoryFile._atomNameReplacements[name] = atoms
 
-    def _guess_element(self, atom_name, residue):
+    @staticmethod
+    def _guess_element(atom_name, residue_name, residue_length):
         "Try to guess the element name"
 
         upper = atom_name.upper()
@@ -592,7 +625,7 @@ class PDBTrajectoryFile(object):
             element = elem.potassium
         elif upper.startswith('ZN'):
             element = elem.zinc
-        elif len(residue) == 1 and upper.startswith('CA'):
+        elif residue_length == 1 and upper.startswith('CA'):
             element = elem.calcium
 
         # TJL has edited this. There are a few issues here. First,
@@ -600,15 +633,15 @@ class PDBTrajectoryFile(object):
         # below. Second, there is additional parsing code in
         # pdbstructure.py, and I am unsure why it doesn't get used
         # here...
-        elif len(residue) > 1 and upper.startswith('CE'):
+        elif residue_length > 1 and upper.startswith('CE'):
             element = elem.carbon  # (probably) not Celenium...
-        elif len(residue) > 1 and upper.startswith('CD'):
+        elif residue_length > 1 and upper.startswith('CD'):
             element = elem.carbon  # (probably) not Cadmium...
-        elif residue.name in ['TRP', 'ARG', 'GLN', 'HIS'] and upper.startswith('NE'):
+        elif residue_name in ['TRP', 'ARG', 'GLN', 'HIS'] and upper.startswith('NE'):
             element = elem.nitrogen  # (probably) not Neon...
-        elif residue.name in ['ASN'] and upper.startswith('ND'):
+        elif residue_name in ['ASN'] and upper.startswith('ND'):
             element = elem.nitrogen  # (probably) not ND...
-        elif residue.name == 'CYS' and upper.startswith('SG'):
+        elif residue_name == 'CYS' and upper.startswith('SG'):
             element = elem.sulfur  # (probably) not SG...
         else:
             try:

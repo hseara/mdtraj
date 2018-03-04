@@ -33,9 +33,9 @@ import sys
 import numpy as np
 from mdtraj.core import element as elem
 from mdtraj.utils.six import iteritems, PY3, u
-from mdtraj.formats.registry import _FormatRegistry
+from mdtraj.formats.registry import FormatRegistry
 from mdtraj.utils import import_, ensure_type, in_units_of, cast_indices
-from mdtraj.formats.hdf5 import ensure_mode
+from mdtraj.formats.hdf5 import _check_mode
 import warnings
 
 MAXINT16 = np.iinfo(np.int16).max
@@ -43,7 +43,7 @@ MAXINT32 = np.iinfo(np.int32).max
 DEFAULT_PRECISION = 1000
 if PY3:
     basestring = str
-    
+
 __all__ = ['LH5TrajectoryFile', 'load_lh5']
 
 ##############################################################################
@@ -78,12 +78,12 @@ def _topology_from_arrays(AtomID, AtomNames, ChainID, ResidueID, ResidueNames):
         if not isinstance(atom_name, basestring):
             atom_name = atom_name.decode()
         element_symbol = atom_name.lstrip('0123456789')[0]
-        
+
         try:
             element = elem.get_by_symbol(element_symbol)
         except KeyError:
-            element = None
-        
+            element = elem.virtual
+
         topology.add_atom(atom_name, element,
                           registered_residues[ResidueID[i]])
 
@@ -116,7 +116,7 @@ def _convert_to_lossy_integers(X, precision=DEFAULT_PRECISION):
 # Main code
 ##############################################################################
 
-@_FormatRegistry.register_loader('.lh5')
+@FormatRegistry.register_loader('.lh5')
 def load_lh5(filename, top=None, stride=None, atom_indices=None, frame=None):
     """Load an deprecated MSMBuilder2 LH5 trajectory file.
 
@@ -143,36 +143,21 @@ def load_lh5(filename, top=None, stride=None, atom_indices=None, frame=None):
     --------
     mdtraj.LH5TrajectoryFile :  Low level interface to LH5 files
     """
-    from mdtraj import Trajectory
-
     atom_indices = cast_indices(atom_indices)
     with LH5TrajectoryFile(filename) as f:
         if frame is not None:
             f.seek(frame)
-            xyz = f.read(n_frames=1, atom_indices=atom_indices)
+            n_frames = 1
         else:
-            xyz = f.read(stride=stride, atom_indices=atom_indices)
-
-        topology = f.topology
-        in_units_of(xyz, f.distance_unit, Trajectory._distance_unit, inplace=True)
-
-        if atom_indices is not None:
-            topology = f.topology.subset(atom_indices)
-
-    time = np.arange(len(xyz))
-    if frame is not None:
-        time += frame
-    elif stride is not None:
-        time *= stride
-
-    return Trajectory(xyz=xyz, topology=topology, time=time)
+            n_frames = None
+        return f.read_as_traj(n_frames=n_frames, stride=stride, atom_indices=atom_indices)
 
 
-@_FormatRegistry.register_fileobject('.lh5')
+@FormatRegistry.register_fileobject('.lh5')
 class LH5TrajectoryFile(object):
     """Interface for reading and writing to a MSMBuilder2 "LH5" molecular
     dynamics trajectory file, a deprecated format.
-    
+
     Parameters
     ----------
     filename : str
@@ -185,7 +170,7 @@ class LH5TrajectoryFile(object):
         already exists? if `force_overwrite=True`, it will be overwritten.
     """
     distance_unit = 'nanometers'
-    
+
 
     def __init__(self, filename, mode='r', force_overwrite=True):
         self._open = False
@@ -236,7 +221,6 @@ class LH5TrajectoryFile(object):
             self._handle.root.ResidueNames[:])
 
     @topology.setter
-    @ensure_mode('w')
     def topology(self, top):
         """Set the topology in the file
 
@@ -245,6 +229,8 @@ class LH5TrajectoryFile(object):
         top : mdtraj.Topology
             A topology object
         """
+        _check_mode(self.mode, ('w',))
+
         if self._needs_initialization:
             self._initialize_headers(top.n_atoms)
             self._needs_initialization = False
@@ -262,7 +248,49 @@ class LH5TrajectoryFile(object):
             node = self._get_node(where='/', name=key)[:] = val[:]
             node[:] = val[:]
 
-    @ensure_mode('r')
+    def read_as_traj(self, n_frames=None, stride=None, atom_indices=None):
+        """Read a trajectory from the LH5 file
+
+        Parameters
+        ----------
+        n_frames : {int, None}
+            The number of frames to read. If not supplied, all of the
+            remaining frames will be read.
+        stride : {int, None}
+            By default all of the frames will be read, but you can pass this
+            flag to read a subset of of the data by grabbing only every
+            `stride`-th frame from disk.
+        atom_indices : {int, None}
+            By default all of the atom  will be read, but you can pass this
+            flag to read only a subsets of the atoms for the `coordinates` and
+            `velocities` fields. Note that you will have to carefully manage
+            the indices and the offsets, since the `i`-th atom in the topology
+            will not necessarily correspond to the `i`-th atom in your subset.
+
+        Returns
+        -------
+        trajectory : Trajectory
+            A trajectory object containing the loaded portion of the file.
+        """
+        _check_mode(self.mode, ('r',))
+
+        from mdtraj.core.trajectory import Trajectory
+        topology = self.topology
+        if atom_indices is not None:
+            topology = topology.subset(atom_indices)
+
+        initial = int(self._frame_index)
+        xyz = self.read(n_frames=n_frames, stride=stride, atom_indices=atom_indices)
+        if len(xyz) == 0:
+            return Trajectory(xyz=np.zeros((0, topology.n_atoms, 3)), topology=topology)
+
+        in_units_of(xyz, self.distance_unit, Trajectory._distance_unit, inplace=True)
+        if stride is None:
+            stride = 1
+        time = (stride*np.arange(len(xyz))) + initial
+
+        return Trajectory(xyz=xyz, topology=topology, time=time)
+
     def read(self, n_frames=None, stride=None, atom_indices=None):
         """Read one or more frames of data from the file
 
@@ -287,6 +315,8 @@ class LH5TrajectoryFile(object):
         xyz : np.ndarray, shape=(n_frames, n_atoms, 3), dtype=np.float32
             The cartesian coordinates, in nanometers
         """
+        _check_mode(self.mode, ('r'))
+
         if n_frames is None:
             n_frames = np.inf
         if stride is not None:
@@ -310,7 +340,6 @@ class LH5TrajectoryFile(object):
         self._frame_index += (frame_slice.stop - frame_slice.start)
         return xyz
 
-    @ensure_mode('w')
     def write(self, coordinates):
         """Write one or more frames of data to the file
 
@@ -319,18 +348,21 @@ class LH5TrajectoryFile(object):
         coordinates : np.ndarray, dtype=np.float32, shape=(n_frames, n_atoms, 3)
             The cartesian coordinates of the atoms in every frame, in nanometers.
         """
+        _check_mode(self.mode, ('w'))
+
         coordinates = ensure_type(coordinates, dtype=np.float32, ndim=3,
                                   name='coordinates', shape=(None, None, 3), can_be_none=False,
                                   warn_on_cast=False, add_newaxis_on_deficient_ndim=True)
         if self._needs_initialization:
             self._initialize_headers(coordinates.shape[1])
             self._needs_initialization = False
-        
+
         coordinates = _convert_to_lossy_integers(coordinates)
         self._get_node(where='/', name='XYZList').append(coordinates)
 
-    @ensure_mode('w')
     def _initialize_headers(self, n_atoms):
+        _check_mode(self.mode, ('w'))
+
         self._create_carray(
             where='/', name='AtomID', atom=self.tables.Int64Atom(), shape=(n_atoms,))
         self._create_carray(
@@ -348,7 +380,6 @@ class LH5TrajectoryFile(object):
             where='/', name='XYZList', atom=self.tables.Int16Atom(),
             shape=(0, n_atoms, 3))
 
-    @ensure_mode('r')
     def seek(self, offset, whence=0):
         """Move to a new file position
 
@@ -362,6 +393,8 @@ class LH5TrajectoryFile(object):
             2: move relative to the end of file, offset should be <= 0.
             Seeking beyond the end of a file is not supported
         """
+        _check_mode(self.mode, ('r',))
+
         if whence == 0 and offset >= 0:
             self._frame_index = offset
         elif whence == 1:
@@ -440,4 +473,3 @@ class LH5TrajectoryFile(object):
         if self.tables.__version__ >= '3.0.0':
             return self._handle.get_node
         return self._handle.getNode
-

@@ -41,7 +41,7 @@ from distutils.version import StrictVersion
 
 import numpy as np
 from mdtraj import version
-from mdtraj.formats.registry import _FormatRegistry
+from mdtraj.formats.registry import FormatRegistry
 from mdtraj.utils import ensure_type, import_, in_units_of, cast_indices
 
 __all__ = ['NetCDFTrajectoryFile', 'load_netcdf']
@@ -50,8 +50,9 @@ __all__ = ['NetCDFTrajectoryFile', 'load_netcdf']
 # classes
 ##############################################################################
 
-@_FormatRegistry.register_loader('.nc')
-@_FormatRegistry.register_loader('.netcdf')
+@FormatRegistry.register_loader('.nc')
+@FormatRegistry.register_loader('.netcdf')
+@FormatRegistry.register_loader('.ncdf')
 def load_netcdf(filename, top=None, stride=None, atom_indices=None, frame=None):
     """Load an AMBER NetCDF file. Since the NetCDF format doesn't contain
     information to specify the topology, you need to supply a topology
@@ -85,30 +86,25 @@ def load_netcdf(filename, top=None, stride=None, atom_indices=None, frame=None):
     mdtraj.NetCDFTrajectoryFile :  Low level interface to NetCDF files
     """
     from mdtraj.core.trajectory import _parse_topology, Trajectory
+    if top is None:
+        raise ValueError('"top" argument is required for load_netcdf')
 
     topology = _parse_topology(top)
     atom_indices = cast_indices(atom_indices)
-    if atom_indices is not None:
-        topology = topology.subset(atom_indices)
 
     with NetCDFTrajectoryFile(filename) as f:
         if frame is not None:
             f.seek(frame)
-            xyz, time, cell_lengths, cell_angles = f.read(n_frames=1, atom_indices=atom_indices)
+            n_frames = 1
         else:
-            xyz, time, cell_lengths, cell_angles = f.read(stride=stride, atom_indices=atom_indices)
+            n_frames = None
 
-        xyz = in_units_of(xyz, f.distance_unit, Trajectory._distance_unit, inplace=True)
-        cell_lengths = in_units_of(cell_lengths, f.distance_unit, Trajectory._distance_unit, inplace=True)
-
-    trajectory = Trajectory(xyz=xyz, topology=topology, time=time,
-                            unitcell_lengths=cell_lengths,
-                            unitcell_angles=cell_angles)
-    return trajectory
+        return f.read_as_traj(topology, n_frames=n_frames, atom_indices=atom_indices, stride=stride)
 
 
-@_FormatRegistry.register_fileobject('.nc')
-@_FormatRegistry.register_fileobject('.netcdf')
+@FormatRegistry.register_fileobject('.nc')
+@FormatRegistry.register_fileobject('.netcdf')
+@FormatRegistry.register_fileobject('.ncdf')
 class NetCDFTrajectoryFile(object):
     """Interface for reading and writing to AMBER NetCDF files. This is a
     file-like object, that supports both reading or writing depending
@@ -180,6 +176,43 @@ class NetCDFTrajectoryFile(object):
         if self._closed:
             raise IOError('The file is closed.')
 
+    def read_as_traj(self, topology, n_frames=None, stride=None, atom_indices=None):
+        """Read a trajectory from a NetCDF file
+
+        Parameters
+        ----------
+        topology : Topology
+            The system topology
+        n_frames : int, optional
+            If positive, then read only the next `n_frames` frames. Otherwise read all
+            of the frames in the file.
+        stride : np.ndarray, optional
+            Read only every stride-th frame.
+        atom_indices : array_like, optional
+            If not none, then read only a subset of the atoms coordinates from the
+            file. This may be slightly slower than the standard read because it required
+            an extra copy, but will save memory.
+
+        Returns
+        -------
+        trajectory : Trajectory
+            A trajectory object containing the loaded portion of the file.
+        """
+        from mdtraj.core.trajectory import Trajectory
+        if atom_indices is not None:
+            topology = topology.subset(atom_indices)
+
+        xyz, time, cell_lengths, cell_angles = self.read(n_frames=n_frames, stride=stride, atom_indices=atom_indices)
+        if len(xyz) == 0:
+            return Trajectory(xyz=np.zeros((0, topology.n_atoms, 3)), topology=topology)
+
+        xyz = in_units_of(xyz, self.distance_unit, Trajectory._distance_unit, inplace=True)
+        cell_lengths = in_units_of(cell_lengths, self.distance_unit, Trajectory._distance_unit, inplace=True)
+
+        return Trajectory(xyz=xyz, topology=topology, time=time,
+                          unitcell_lengths=cell_lengths,
+                          unitcell_angles=cell_angles)
+
     def read(self, n_frames=None, stride=None, atom_indices=None):
         """Read data from a molecular dynamics trajectory in the AMBER NetCDF
         format.
@@ -247,7 +280,6 @@ class NetCDFTrajectoryFile(object):
         if 'time' in self._handle.variables:
             time = self._handle.variables['time'][frame_slice]
         else:
-            warnings.warn('No time information found in the NetCDF file')
             time = None
 
         if 'cell_lengths' in self._handle.variables:
@@ -418,17 +450,17 @@ class NetCDFTrajectoryFile(object):
             self._handle.createDimension('label', 5)
 
             # Define variables to store unit cell data
-            self._handle.createVariable('cell_spatial', 'c', ('cell_spatial',))
-            cell_angles = self._handle.createVariable('cell_angular', 'c', ('cell_spatial', 'label'))
             cell_lengths = self._handle.createVariable('cell_lengths', 'd', ('frame', 'cell_spatial'))
             setattr(cell_lengths, 'units', 'angstrom')
             cell_angles = self._handle.createVariable('cell_angles', 'd', ('frame', 'cell_angular'))
             setattr(cell_angles, 'units', 'degree')
 
-            self._handle.variables['cell_spatial'][0] = 'x'
-            self._handle.variables['cell_spatial'][1] = 'y'
-            self._handle.variables['cell_spatial'][2] = 'z'
+            self._handle.createVariable('cell_spatial', 'c', ('cell_spatial',))
+            self._handle.variables['cell_spatial'][0] = 'a'
+            self._handle.variables['cell_spatial'][1] = 'b'
+            self._handle.variables['cell_spatial'][2] = 'c'
 
+            self._handle.createVariable('cell_angular', 'c', ('cell_spatial', 'label'))
             self._handle.variables['cell_angular'][0] = 'alpha'
             self._handle.variables['cell_angular'][1] = 'beta '
             self._handle.variables['cell_angular'][2] = 'gamma'
@@ -441,6 +473,11 @@ class NetCDFTrajectoryFile(object):
         if set_coordinates:
             frame_coordinates = self._handle.createVariable('coordinates', 'f', ('frame', 'atom', 'spatial'))
             setattr(frame_coordinates, 'units', 'angstrom')
+
+            self._handle.createVariable('spatial', 'c', ('spatial',))
+            self._handle.variables['spatial'][0] = 'x'
+            self._handle.variables['spatial'][1] = 'y'
+            self._handle.variables['spatial'][2] = 'z'
 
     def seek(self, offset, whence=0):
         """Move to a new file position

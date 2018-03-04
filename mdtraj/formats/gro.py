@@ -3,10 +3,10 @@
 ##############################################################################
 # MDTraj: A Python Library for Loading, Saving, and Manipulating
 #         Molecular Dynamics Trajectories.
-# Copyright 2012-2014 Stanford University and the Authors
+# Copyright 2012-2015 Stanford University and the Authors
 #
 # Authors: Robert McGibbon, Lee-Ping Wang, Peter Eastman
-# Contributors:
+# Contributors: Jason Swails
 #
 # MDTraj is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License as
@@ -52,7 +52,7 @@
 import os
 import sys
 import itertools
-from re import sub, match
+from re import sub, match, findall
 # import element as elem
 import numpy as np
 
@@ -60,14 +60,14 @@ import mdtraj as md
 from mdtraj.utils import in_units_of, cast_indices, ensure_type
 from mdtraj.formats import pdb
 from mdtraj.core import element as elem
-from mdtraj.formats.registry import _FormatRegistry
+from mdtraj.formats.registry import FormatRegistry
 
 
 ##############################################################################
 # Code
 ##############################################################################
 
-@_FormatRegistry.register_loader('.gro')
+@FormatRegistry.register_loader('.gro')
 def load_gro(filename, stride=None, atom_indices=None, frame=None):
     """Load a GROMACS GRO file.
 
@@ -91,20 +91,14 @@ def load_gro(filename, stride=None, atom_indices=None, frame=None):
         topology = f.topology
         if frame is not None:
             f.seek(frame)
-            coordinates, time, unitcell_vectors = f.read(n_frames=1, atom_indices=atom_indices)
+            n_frames = 1
         else:
-            coordinates, time, unitcell_vectors = f.read(stride=stride, atom_indices=atom_indices)
-
-        coordinates = in_units_of(coordinates, f.distance_unit, Trajectory._distance_unit, inplace=True)
-        unitcell_vectors = in_units_of(unitcell_vectors, f.distance_unit, Trajectory._distance_unit, inplace=True)
-
-    traj = Trajectory(xyz=coordinates, topology=topology, time=time)
-    traj.unitcell_vectors = unitcell_vectors
-
-    return traj
+            n_frames = None
+        return f.read_as_traj(n_frames=n_frames, stride=stride,
+                              atom_indices=atom_indices)
 
 
-@_FormatRegistry.register_fileobject('.gro')
+@FormatRegistry.register_fileobject('.gro')
 class GroTrajectoryFile(object):
     """Interface for reading and writing to GROMACS GRO files.
 
@@ -154,7 +148,8 @@ class GroTrajectoryFile(object):
             raise ValueError("invalid mode: %s" % mode)
 
 
-    def write(self, coordinates, topology, time=None, unitcell_vectors=None):
+    def write(self, coordinates, topology, time=None, unitcell_vectors=None,
+              precision=3):
         """Write one or more frames of a molecular dynamics trajectory to disk
         in the GROMACS GRO format.
 
@@ -169,6 +164,8 @@ class GroTrajectoryFile(object):
             If not supplied, the numbers 0..n_frames will be written.
         unitcell_vectors : np.ndarray, dtype=float32, shape=(n_frames, 3, 3), optional
             The periodic box vectors of the simulation in each frame, in nanometers.
+        precision : int, optional
+            The number of decimal places to print for coordinates. Default is 3
         """
         if not self._open:
             raise ValueError('I/O operation on closed file')
@@ -183,7 +180,44 @@ class GroTrajectoryFile(object):
         for i in range(coordinates.shape[0]):
             frame_time = None if time is None else time[i]
             frame_box = None if unitcell_vectors is None else unitcell_vectors[i]
-            self._write_frame(coordinates[i], topology, frame_time, frame_box)
+            self._write_frame(coordinates[i], topology, frame_time, frame_box, precision)
+
+    def read_as_traj(self, n_frames=None, stride=None, atom_indices=None):
+        """Read a trajectory from a gro file
+
+        Parameters
+        ----------
+        n_frames : int, optional
+            If positive, then read only the next `n_frames` frames. Otherwise read all
+            of the frames in the file.
+        stride : np.ndarray, optional
+            Read only every stride-th frame.
+        atom_indices : array_like, optional
+            If not none, then read only a subset of the atoms coordinates from the
+            file. This may be slightly slower than the standard read because it required
+            an extra copy, but will save memory.
+
+        Returns
+        -------
+        trajectory : Trajectory
+            A trajectory object containing the loaded portion of the file.
+        """
+        from mdtraj.core.trajectory import Trajectory
+        topology = self.topology
+        if atom_indices is not None:
+            topology = topology.subset(atom_indices)
+
+        coordinates, time, unitcell_vectors = self.read(stride=stride, atom_indices=atom_indices)
+        if len(coordinates) == 0:
+            return Trajectory(xyz=np.zeros((0, topology.n_atoms, 3)), topology=topology)
+
+        coordinates = in_units_of(coordinates, self.distance_unit, Trajectory._distance_unit, inplace=True)
+        unitcell_vectors = in_units_of(unitcell_vectors, self.distance_unit, Trajectory._distance_unit, inplace=True)
+
+        traj = Trajectory(xyz=coordinates, topology=topology, time=time)
+        traj.unitcell_vectors = unitcell_vectors
+        return traj
+
 
     def read(self, n_frames=None, stride=None, atom_indices=None):
         """Read data from a molecular dynamics trajectory in the GROMACS GRO
@@ -277,13 +311,12 @@ class GroTrajectoryFile(object):
                         atomReplacements = {}
 
                 thiselem = thisatomname
-                element = None
                 if len(thiselem) > 1:
                     thiselem = thiselem[0] + sub('[A-Z0-9]','',thiselem[1:])
                 try:
                     element = elem.get_by_symbol(thiselem)
                 except KeyError:
-                    pass
+                    element = elem.virtual
                 if thisatomname in atomReplacements:
                     thisatomname = atomReplacements[thisatomname]
 
@@ -305,20 +338,26 @@ class GroTrajectoryFile(object):
         xyz = np.zeros((self.n_atoms, 3), dtype=np.float32)
 
         got_line = False
+        firstDecimalPos = None
+        atomindex = -1
         for ln, line in enumerate(self._file):
             got_line = True
             if ln == 0:
                 comment = line.strip()
+                continue
             elif ln == 1:
                 assert self.n_atoms == int(line.strip())
-            elif _is_gro_coord(line):
+                continue
+            if firstDecimalPos is None:
+                try:
+                    firstDecimalPos = line.index('.', 20)
+                    secondDecimalPos = line.index('.', firstDecimalPos+1)
+                except ValueError:
+                    firstDecimalPos = secondDecimalPos = None
+            crd = _parse_gro_coord(line, firstDecimalPos, secondDecimalPos)
+            if crd is not None and atomindex < self.n_atoms - 1:
                 atomindex = next(atomcounter)
-
-                firstDecimalPos = line.index('.', 20)
-                secondDecimalPos = line.index('.', firstDecimalPos+1)
-                digits = secondDecimalPos-firstDecimalPos
-                pos = [float(line[20+i*digits:20+(i+1)*digits]) for i in range(3)]
-                xyz[atomindex, :] = (pos[0], pos[1], pos[2])
+                xyz[atomindex, :] = (crd[0], crd[1], crd[2])
             elif _is_gro_box(line) and ln == self.n_atoms + 2:
                 sline = line.split()
                 boxvectors = tuple([float(i) for i in sline])
@@ -333,7 +372,7 @@ class GroTrajectoryFile(object):
         time = None
         if 't=' in comment:
             # title string (free format string, optional time in ps after 't=')
-            time = float(comment[comment.index('t=')+2:].strip())
+            time = float(findall('t= *(\d+\.\d+)',comment)[-1])
 
         # box vectors (free format, space separated reals), values: v1(x) v2(y)
         # v3(z) v1(y) v1(z) v2(x) v2(z) v3(x) v3(y), the last 6 values may be
@@ -341,18 +380,21 @@ class GroTrajectoryFile(object):
         box = [boxvectors[i] if i < len(boxvectors) else 0 for i in range(9)]
         unitcell_vectors = np.array([
             [box[0], box[3], box[4]],
-            [box[1], box[5], box[6]],
-            [box[2], box[7], box[8]]])
+            [box[5], box[1], box[6]],
+            [box[7], box[8], box[2]]])
 
         return xyz, unitcell_vectors, time
 
-    def _write_frame(self, coordinates, topology, time, box):
+    def _write_frame(self, coordinates, topology, time, box, precision):
         comment = 'Generated with MDTraj'
         if time is not None:
             comment += ', t= %s' % time
 
+        varwidth = precision + 5
+        fmt = '%%5d%%-5s%%5s%%5d%%%d.%df%%%d.%df%%%d.%df' % (
+                varwidth, precision, varwidth, precision, varwidth, precision)
         assert topology.n_atoms == coordinates.shape[0]
-        lines = [comment, '  %d' % topology.n_atoms]
+        lines = [comment, ' %d' % topology.n_atoms]
         if box is None:
             box = np.zeros((3,3))
 
@@ -362,9 +404,10 @@ class GroTrajectoryFile(object):
             serial = atom.serial
             if serial is None:
                 serial = atom.index
-            lines.append("%5d%-5s%5s%5d%8.3f%8.3f%8.3f" % (
-                residue.resSeq, residue.name, atom.name, serial,
-                coordinates[i, 0], coordinates[i, 1], coordinates[i, 2]))
+            if serial >= 100000:
+                serial -= 100000
+            lines.append(fmt % (residue.resSeq, residue.name, atom.name, serial,
+                                coordinates[i, 0], coordinates[i, 1], coordinates[i, 2]))
 
         lines.append('%10.5f%10.5f%10.5f%10.5f%10.5f%10.5f%10.5f%10.5f%10.5f' % (
             box[0,0], box[1,1], box[2,2],
@@ -372,6 +415,7 @@ class GroTrajectoryFile(object):
             box[1,2], box[2,0], box[2,1]))
 
         self._file.write('\n'.join(lines))
+        self._file.write('\n')
 
     def seek(self, offset, whence=0):
         """Move to a new file position
@@ -436,19 +480,19 @@ def _isfloat(word):
     """
     return match('^[-+]?[0-9]*\.?[0-9]*([eEdD][-+]?[0-9]+)?$',word)
 
-def _is_gro_coord(line):
+def _parse_gro_coord(line, firstDecimal, secondDecimal):
     """ Determines whether a line contains GROMACS data or not
 
     @param[in] line The line to be tested
 
     """
-    sline = line.split()
-    if len(sline) == 6 or len(sline) == 9:
-        return all([_isint(sline[2]), _isfloat(sline[3]), _isfloat(sline[4]), _isfloat(sline[5])])
-    elif len(sline) == 5 or len(sline) == 8:
-        return all([_isint(line[15:20]), _isfloat(sline[2]), _isfloat(sline[3]), _isfloat(sline[4])])
-    else:
-        return 0
+    if firstDecimal is None or secondDecimal is None:
+        return None
+    digits = secondDecimal - firstDecimal
+    try:
+        return tuple(float(line[20+i*digits:20+(i+1)*digits]) for i in range(3))
+    except ValueError:
+        return None
 
 def _is_gro_box(line):
     """ Determines whether a line contains a GROMACS box vector or not

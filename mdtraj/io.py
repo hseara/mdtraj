@@ -57,6 +57,9 @@ and ``mdtraj.io.saveh``, for loading and saving generic arrays to disk.
 These functions act like ``numpy.savez`` and ``numpy.loadz``, but use a
 PyTables HDF5 for superior performance and compression.
 
+It also provides open_maybe_zipped for selecting the correct reader based on the
+filename.
+
 Nothing in this module is specific to molecular dynamics trajectories.
 
 Examples
@@ -71,12 +74,14 @@ True
 Functions
 ---------
 """
-from __future__ import print_function, division
+from __future__ import print_function, division, absolute_import
+
+import io
 import os
 import warnings
 import numpy as np
 from mdtraj.utils import import_
-from mdtraj.utils.six import PY3, iteritems
+from mdtraj.utils.six import PY2, PY3, iteritems, StringIO
 if PY3:
     basestring = str
 tables = import_('tables')
@@ -89,6 +94,25 @@ try:
 except Exception:  #type?
     warnings.warn("Missing Zlib; no compression will used.")
     COMPRESSION = tables.Filters()
+
+
+# Note to developers: This module is pseudo-deprecated. It provides (loadh, saveh)
+# which are useful functions (and we want to maintain them), but aren't really
+# within the scope of MDTraj as we now understand it.
+#
+# With that said, many people use these functions and no good would come from getting
+# rid of them. But we shouldn't add any new functions or new features to this file.
+#
+# One potential landmine is that this file _requires_ the `tables` package, which is
+# only an _optional_ dependency in MDTraj. So if you import this file (or anything in
+# it) from another file that is imported at startup (on a user running `import mdtraj`)
+# then tables ceases to be an optional dependency and becomes a strict requirement.
+#
+# So add new features to a different file, and there shouldn't be any reason for
+# any files inside MDTraj to `import mdtraj.io`.
+#
+# See github issue #852.
+
 
 def saveh(file, *args, **kwargs):
     """Save several numpy arrays into a single file in compressed ``.hdf`` format.
@@ -167,7 +191,10 @@ def saveh(file, *args, **kwargs):
 
     for key in namedict.keys():
         if key in current_nodes:
-            handle.removeNode('/', name=key)
+            if TABLES2:
+                handle.removeNode('/', name=key)
+            else:
+                handle.remove_node('/', name=key)
             # per discussion on github, https://github.com/rmcgibbo/mdtraj/issues/5
             # silent overwriting appears to be the desired functionality
             # raise IOError('Array already exists in file: %s' % key)

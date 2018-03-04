@@ -2,32 +2,15 @@ from __future__ import print_function, absolute_import
 import os
 import sys
 import json
-import string
 import shutil
 import subprocess
 import tempfile
+from setuptools import Extension
 from distutils.dep_util import newer_group
-from distutils.core import Extension
-from distutils.errors import DistutilsExecError
+from distutils.errors import DistutilsExecError, DistutilsSetupError
 from distutils.ccompiler import new_compiler
 from distutils.sysconfig import customize_compiler, get_config_vars
-from distutils.command.build_ext import build_ext as _build_ext
-
-
-def find_packages():
-    """Find all of mdtraj's python packages.
-    Adapted from IPython's setupbase.py. Copyright IPython
-    contributors, licensed under the BSD license.
-    """
-    packages = ['mdtraj.scripts']
-    for dir,subdirs,files in os.walk('mdtraj'):
-        package = dir.replace(os.path.sep, '.')
-        if '__init__.py' not in files:
-            # not a package
-            continue
-        packages.append(package)
-    return packages
-
+from setuptools.command.build_ext import build_ext as _build_ext
 
 
 ################################################################################
@@ -46,21 +29,29 @@ class CompilerDetection(object):
     _DONT_REMOVE_ME = get_config_vars()
 
     def __init__(self, disable_openmp):
+        self.disable_openmp = disable_openmp
+        self._is_initialized = False
+
+    def initialize(self):
+        if self._is_initialized:
+            return
+
         cc = new_compiler()
         customize_compiler(cc)
 
         self.msvc = cc.compiler_type == 'msvc'
         self._print_compiler_version(cc)
 
-        if disable_openmp:
+        if self.disable_openmp:
             self.openmp_enabled = False
         else:
             self.openmp_enabled, openmp_needs_gomp = self._detect_openmp()
         self.sse3_enabled = self._detect_sse3() if not self.msvc else True
         self.sse41_enabled = self._detect_sse41() if not self.msvc else True
 
-        self.compiler_args_sse2  = ['-msse2'] if not self.msvc else ['/arch:SSE2']
-        self.compiler_args_sse3  = ['-mssse3'] if (self.sse3_enabled and not self.msvc) else []
+        self.compiler_args_sse2 = ['-msse2'] if not self.msvc else ['/arch:SSE2']
+        self.compiler_args_sse3 = ['-mssse3'] if (self.sse3_enabled and not self.msvc) else []
+        self.compiler_args_warn = ['-Wno-unused-function', '-Wno-unreachable-code', '-Wno-sign-compare'] if not self.msvc else []
 
         self.compiler_args_sse41, self.define_macros_sse41 = [], []
         if self.sse41_enabled:
@@ -86,6 +77,7 @@ class CompilerDetection(object):
         else:
             self.compiler_args_opt = ['-O3', '-funroll-loops']
         print()
+        self._is_initialized = True
 
     def _print_compiler_version(self, cc):
         print("C compiler:")
@@ -225,37 +217,46 @@ def git_version():
     return GIT_REVISION
 
 
-def write_version_py(VERSION, ISRELEASED, filename='mdtraj/version.py'):
+def write_version_py(version, isreleased, filename):
     cnt = """
-# THIS FILE IS GENERATED FROM MDTRAJ SETUP.PY
-short_version = '%(version)s'
-version = '%(version)s'
-full_version = '%(full_version)s'
-git_revision = '%(git_revision)s'
-release = %(isrelease)s
-
-if not release:
-    version = full_version
+# This file is generated in setup.py at build time.
+version = '{version}'
+short_version = '{short_version}'
+full_version = '{full_version}'
+git_revision = '{git_revision}'
+release = {release}
 """
-    # Adding the git rev number needs to be done inside write_version_py(),
-    # otherwise the import of numpy.version messes up the build under Python 3.
-    FULLVERSION = VERSION
+    # git_revision
     if os.path.exists('.git'):
-        GIT_REVISION = git_version()
+        git_revision = git_version()
     else:
-        GIT_REVISION = 'Unknown'
+        git_revision = 'Unknown'
 
-    if not ISRELEASED:
-        FULLVERSION += '.dev-' + GIT_REVISION[:7]
+    # short_version, full_version
+    if isreleased:
+        full_version = version
+        short_version = version
+    else:
+        full_version = ("{version}+{git_revision}"
+                        .format(version=version, git_revision=git_revision))
+        short_version = version
 
-    a = open(filename, 'w')
+    with open(filename, 'w') as f:
+        f.write(cnt.format(version=version,
+                           short_version=short_version,
+                           full_version=full_version,
+                           git_revision=git_revision,
+                           release=isreleased))
+
+
+def numpy_include_dir():
+    """Get the path of numpy headers."""
     try:
-        a.write(cnt % {'version': VERSION,
-                       'full_version': FULLVERSION,
-                       'git_revision': GIT_REVISION,
-                       'isrelease': str(ISRELEASED)})
-    finally:
-        a.close()
+        import numpy as np
+    except ImportError:
+        print("Cannot build mdtraj extensions without numpy installed.")
+        sys.exit(1)
+    return np.get_include()
 
 
 class StaticLibrary(Extension):
@@ -267,10 +268,17 @@ class StaticLibrary(Extension):
 class build_ext(_build_ext):
 
     def build_extension(self, ext):
+        ext.include_dirs.append(numpy_include_dir())
         if isinstance(ext, StaticLibrary):
             self.build_static_extension(ext)
         else:
             _build_ext.build_extension(self, ext)
+
+    def copy_extensions_to_source(self):
+        _extensions = self.extensions
+        self.extensions = [e for e in _extensions if not isinstance(e, StaticLibrary)]
+        _build_ext.copy_extensions_to_source(self)
+        self.extensions = _extensions
 
     def build_static_extension(self, ext):
         from distutils import log
@@ -278,9 +286,9 @@ class build_ext(_build_ext):
         sources = ext.sources
         if sources is None or not isinstance(sources, (list, tuple)):
             raise DistutilsSetupError(
-                  ("in 'ext_modules' option (extension '%s'), " +
-                   "'sources' must be present and must be " +
-                   "a list of source filenames") % ext.name)
+                ("in 'ext_modules' option (extension '%s'), " +
+                 "'sources' must be present and must be " +
+                 "a list of source filenames") % ext.name)
         sources = list(sources)
 
         ext_path = self.get_ext_fullpath(ext.name)
@@ -296,12 +304,12 @@ class build_ext(_build_ext):
         for undef in ext.undef_macros:
             macros.append((undef,))
         objects = self.compiler.compile(sources,
-                                         output_dir=self.build_temp,
-                                         macros=macros,
-                                         include_dirs=ext.include_dirs,
-                                         debug=self.debug,
-                                         extra_postargs=extra_args,
-                                         depends=ext.depends)
+                                        output_dir=self.build_temp,
+                                        macros=macros,
+                                        include_dirs=ext.include_dirs,
+                                        debug=self.debug,
+                                        extra_postargs=extra_args,
+                                        depends=ext.depends)
         self._built_objects = objects[:]
         if ext.extra_objects:
             objects.extend(ext.extra_objects)
@@ -313,17 +321,47 @@ class build_ext(_build_ext):
         output_dir = os.path.dirname(ext_path)
 
         if (self.compiler.static_lib_format.startswith('lib') and
-            libname.startswith('lib')):
+                libname.startswith('lib')):
             libname = libname[3:]
+
+        # 1. copy to build directory
+        # 1. copy to src tree for develop mode
+        import re
+        src_tree_output_dir = re.match('build.*(mdtraj.*)', output_dir).group(1)
+
+        if not os.path.exists(src_tree_output_dir):
+            os.makedirs(src_tree_output_dir)
 
         if not os.path.exists(output_dir):
             # necessary for windows
             os.makedirs(output_dir)
 
+        assert os.path.isdir(src_tree_output_dir)
+
         self.compiler.create_static_lib(objects,
-            output_libname=libname,
-            output_dir=output_dir,
-            target_lang=language)
+                                        output_libname=libname,
+                                        output_dir=output_dir,
+                                        target_lang=language)
+
+        lib_path = self.compiler.library_filename(libname, output_dir=output_dir)
+
+        shutil.copy(lib_path, src_tree_output_dir)
 
         for item in ext.export_include:
+            shutil.copy(item, src_tree_output_dir)
             shutil.copy(item, output_dir)
+
+    def get_ext_filename(self, ext_name):
+        filename = _build_ext.get_ext_filename(self, ext_name)
+
+        try:
+            exts = [e for e in self.extensions if ext_name in {e.name, e.name.split('.')[-1]}]
+            ext = exts[0]
+            if isinstance(ext, StaticLibrary):
+                if new_compiler().compiler_type == 'msvc':
+                    return filename.split('.')[0] + '.lib'
+                else:
+                    return filename.split('.')[0] + '.a'
+        except Exception as e:
+            pass
+        return filename

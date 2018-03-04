@@ -16,13 +16,13 @@
 #include <map>
 #include <algorithm>
 #include "geometry.h"
+#include "vectorize_sse.h"
 
 #define MIN(X, Y) ((X) < (Y) ? (X) : (Y))
 #define MAX(X, Y) ((X) > (Y) ? (X) : (Y))
 #define CLIP(X, X_min, X_max) (MIN(MAX(X, X_min), X_max))
 
 #include <pmmintrin.h>
-#include "ssetools.h"
 #include "msvccompat.h"
 #include <math.h>
 
@@ -141,16 +141,16 @@ static void calculate_beta_sheets(const int* chain_ids, const int* hbonds,
 
     // Extend ladders
     sort(bridges.begin(), bridges.end());
-    for (unsigned int i = 0; i < bridges.size(); ++i) {
-        for (unsigned int j = i + 1; j < bridges.size(); ++j) {
-            unsigned int ibi = bridges[i].i.front();
-            unsigned int iei = bridges[i].i.back();
-            unsigned int jbi = bridges[i].j.front();
-            unsigned int jei = bridges[i].j.back();
-            unsigned int ibj = bridges[j].i.front();
-            unsigned int iej = bridges[j].i.back();
-            unsigned int jbj = bridges[j].j.front();
-            unsigned int jej = bridges[j].j.back();
+    for (int i = 0; i < (int) bridges.size(); ++i) {
+        for (int j = i + 1; j < (int) bridges.size(); ++j) {
+            int ibi = bridges[i].i.front();
+            int iei = bridges[i].i.back();
+            int jbi = bridges[i].j.front();
+            int jei = bridges[i].j.back();
+            int ibj = bridges[j].i.front();
+            int iej = bridges[j].i.back();
+            int jbj = bridges[j].j.front();
+            int jej = bridges[j].j.back();
 
             if ((bridges[i].type != bridges[j].type) ||
                 chain_ids[std::min(ibi, ibj)] != chain_ids[std::max(iei, iej)] ||
@@ -161,9 +161,9 @@ static void calculate_beta_sheets(const int* chain_ids, const int* hbonds,
 
             bool bulge;
             if (bridges[i].type == BRIDGE_PARALLEL)
-                bulge = ((jbj - jei < 6 && ibj - iei < 3) || (jbj - jei < 3));
+                bulge = (jbj > jbi) && ((jbj - jei < 6 && ibj - iei < 3) || (jbj - jei < 3));
             else
-                bulge = ((jbi - jej < 6 && ibj - iei < 3) || (jbi - jej < 3));
+                bulge = (jbj < jbi) && ((jbi - jej < 6 && ibj - iei < 3) || (jbi - jej < 3));
 
             if (bulge) {
                 bridges[i].i.insert(bridges[i].i.end(), bridges[j].i.begin(), bridges[j].i.end());
@@ -206,21 +206,16 @@ static void calculate_beta_sheets(const int* chain_ids, const int* hbonds,
 static std::vector<int> calculate_bends(const float* xyz, const int* ca_indices,
     const int* chain_ids, const int n_residues, std::vector<int>& skip)
 {
-    __m128 prev_ca, this_ca, next_ca, u_prime, v_prime, u, v;
-    float kappa;
     std::vector<int> is_bend(n_residues, 0);
     for (int i = 2; i < n_residues-2; i++) {
         if (chain_ids[i-2] == chain_ids[i+2] && !skip[i-2] && !skip[i] && !skip[i+2]) {
-            prev_ca = load_float3(xyz + 3*ca_indices[i-2]);
-            this_ca = load_float3(xyz + 3*ca_indices[i]);
-            next_ca = load_float3(xyz + 3*ca_indices[i+2]);
-            u_prime = _mm_sub_ps(prev_ca, this_ca);
-            v_prime = _mm_sub_ps(this_ca, next_ca);
-            /* normalize the vectors u_prime and v_prime */
-            u = _mm_div_ps(u_prime, _mm_sqrt_ps(_mm_dp_ps2(u_prime, u_prime, 0x7F)));
-            v = _mm_div_ps(v_prime, _mm_sqrt_ps(_mm_dp_ps2(v_prime, v_prime, 0x7F)));
-            /* compute the arccos of the dot product. this gives the angle */
-            kappa = (float) acos(CLIP(_mm_cvtss_f32(_mm_dp_ps2(u, v, 0x71)), -1, 1));
+            fvec4 prev_ca(xyz[3*ca_indices[i-2]], xyz[3*ca_indices[i-2]+1], xyz[3*ca_indices[i-2]+2], 0);
+            fvec4 this_ca(xyz[3*ca_indices[i]], xyz[3*ca_indices[i]+1], xyz[3*ca_indices[i]+2], 0);
+            fvec4 next_ca(xyz[3*ca_indices[i+2]], xyz[3*ca_indices[i+2]+1], xyz[3*ca_indices[i+2]+2], 0);
+            fvec4 u_prime = prev_ca-this_ca;
+            fvec4 v_prime = this_ca-next_ca;
+            float cosangle = dot3(u_prime, v_prime)/sqrtf(dot3(u_prime, u_prime)*dot3(v_prime, v_prime));
+            float kappa = acosf(CLIP(cosangle, -1, 1));
             is_bend[i] = kappa > (70 * (M_PI / 180.0));
         }
     }
@@ -250,7 +245,7 @@ static void calculate_alpha_helices(const float* xyz,
         std::vector<int> residues = it->second;
 
         for (int stride = 3; stride <= 5; stride++) {
-            for (unsigned int ii = 0; ii < residues.size(); ii++) {
+            for (int ii = 0; ii < (int) residues.size(); ii++) {
                 int i = residues[ii];
 
                 if ((i+stride) < n_residues && _test_bond(i+stride, i, hbonds) && (chain_ids[i] == chain_ids[i+stride])) {
@@ -304,7 +299,7 @@ static void calculate_alpha_helices(const float* xyz,
         }
 
     const std::vector<int> is_bend = calculate_bends(xyz, ca_indices, chain_ids, n_residues, skip);
-    for (unsigned i = 1; i < n_residues-1; i++)
+    for (int i = 1; i < n_residues-1; i++)
         if (secondary[i] == SS_LOOP && !skip[i]) {
             bool isTurn = false;
             for (int stride = 3; stride <= 5 && !isTurn; ++stride)
@@ -346,9 +341,9 @@ static void calculate_alpha_helices(const float* xyz,
  *     null bytes) so you should be careful using it a input to libc string
  *     functions.
  */
-int dssp(const float* xyz, const int* nco_indices, const int* ca_indices,
-         const int* is_proline, const int* chain_ids, const int n_frames,
-         const int n_atoms, const int n_residues, char* secondary)
+void dssp(const float* xyz, const int* nco_indices, const int* ca_indices,
+          const int* is_proline, const int* chain_ids, const int n_frames,
+          const int n_atoms, const int n_residues, char* secondary)
 {
     std::vector<int> skip(n_residues, 0);
     for (int i = 0; i < n_residues; i++)
@@ -389,6 +384,4 @@ int dssp(const float* xyz, const int* nco_indices, const int* ca_indices,
             secondary[i*n_residues+j] = ss;
         }
     }
-
-    return 1;
 }

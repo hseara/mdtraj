@@ -21,8 +21,8 @@
 ##############################################################################
 
 """
-This module implements the MDTraj HDF5 format described in
-https://github.com/rmcgibbo/mdtraj/issues/36
+This module implements the MDTraj HDF5 format described at
+https://github.com/mdtraj/mdtraj/wiki/HDF5-Trajectory-Format
 """
 
 ##############################################################################
@@ -52,46 +52,9 @@ import mdtraj.core.element as elem
 from mdtraj.core.topology import Topology
 from mdtraj.utils import in_units_of, ensure_type, import_, cast_indices
 from mdtraj.utils.six import string_types
-from mdtraj.formats.registry import _FormatRegistry
+from mdtraj.formats.registry import FormatRegistry
 
 __all__ = ['HDF5TrajectoryFile', 'load_hdf5']
-
-##############################################################################
-# Utilities
-##############################################################################
-
-
-def ensure_mode(*m):
-    """This is a little decorator that is used inside HDF5Trajectory
-    to validate that the file is open in the correct mode before doing
-    a a method
-
-    Parameters
-    ----------
-    m : str or list
-        One or more of ['w', 'r', 'a'], giving the allowable modes
-        for the method
-
-    Examples
-    --------
-    class HDF5Trajectory:
-        @ensure_mode('w')
-        def method_that_is_only_allowed_to_be_called_in_write_mode(self):
-            print('i must be in write mode!')
-    """
-    def inner(f):
-        @wraps(f)
-        def wrapper(*args, **kwargs):
-            # args[0] is self on the method
-            if args[0].mode in m:
-                return f(*args, **kwargs)
-            raise ValueError('This operation is only available when a file '
-                             'is open in mode="%s".' % args[0].mode)
-        # hack for to set argpsec for our custon numpydoc sphinx extension
-        setattr(wrapper, '__argspec__', inspect.getargspec(f))
-        return wrapper
-    return inner
-
 
 Frames = namedtuple('Frames', ['coordinates', 'time', 'cell_lengths', 'cell_angles',
                                'velocities', 'kineticEnergy', 'potentialEnergy',
@@ -101,8 +64,8 @@ Frames = namedtuple('Frames', ['coordinates', 'time', 'cell_lengths', 'cell_angl
 # Code
 ##############################################################################
 
-@_FormatRegistry.register_loader('.h5')
-@_FormatRegistry.register_loader('.hdf5')
+@FormatRegistry.register_loader('.h5')
+@FormatRegistry.register_loader('.hdf5')
 def load_hdf5(filename, stride=None, atom_indices=None, frame=None):
     """Load an MDTraj hdf5 trajectory file from disk.
 
@@ -141,31 +104,23 @@ def load_hdf5(filename, stride=None, atom_indices=None, frame=None):
     --------
     mdtraj.HDF5TrajectoryFile :  Low level interface to HDF5 files
     """
-    from mdtraj.core.trajectory import _parse_topology, Trajectory
+    if not isinstance(filename, string_types):
+        raise TypeError('filename must be of type string for load_lh5. '
+            'you supplied %s' % type(filename))
+
     atom_indices = cast_indices(atom_indices)
 
     with HDF5TrajectoryFile(filename) as f:
         if frame is not None:
             f.seek(frame)
-            data = f.read(n_frames=1, atom_indices=atom_indices)
+            n_frames = 1
         else:
-            data = f.read(stride=stride, atom_indices=atom_indices)
-
-        topology = f.topology
-        in_units_of(data.coordinates, f.distance_unit, Trajectory._distance_unit, inplace=True)
-        in_units_of(data.cell_lengths, f.distance_unit, Trajectory._distance_unit, inplace=True)
-
-        if atom_indices is not None:
-            topology = f.topology.subset(atom_indices)
-
-    trajectory = Trajectory(xyz=data.coordinates, topology=topology,
-                            time=data.time, unitcell_lengths=data.cell_lengths,
-                            unitcell_angles=data.cell_angles)
-    return trajectory
+            n_frames = None
+        return f.read_as_traj(n_frames=n_frames, stride=stride, atom_indices=atom_indices)
 
 
-@_FormatRegistry.register_fileobject('.h5')
-@_FormatRegistry.register_fileobject('.hdf5')
+@FormatRegistry.register_fileobject('.h5')
+@FormatRegistry.register_fileobject('.hdf5')
 class HDF5TrajectoryFile(object):
     """Interface for reading and writing to a MDTraj HDF5 molecular
     dynamics trajectory file, whose format is described
@@ -254,13 +209,13 @@ class HDF5TrajectoryFile(object):
             self._needs_initialization = False
 
     @property
-    @ensure_mode('r', 'a')
     def root(self):
         """Direct access to the root group of the underlying Tables HDF5 file handle.
 
         This can be used for random or specific access to the underlying arrays
         on disk
         """
+        _check_mode(self.mode, ('r', 'a'))
         return self._handle.root
 
     #####################################################
@@ -275,9 +230,9 @@ class HDF5TrajectoryFile(object):
         return None
 
     @title.setter
-    @ensure_mode('w', 'a')
     def title(self, value):
         """Set the user-defined title for the data represented in the file"""
+        _check_mode(self.mode, ('w', 'a'))
         self._handle.root._v_attrs.title = str(value)
 
     #####################################################
@@ -292,9 +247,9 @@ class HDF5TrajectoryFile(object):
         return None
 
     @application.setter
-    @ensure_mode('w', 'a')
     def application(self, value):
         "Set the suite of programs that created the file"
+        _check_mode(self.mode, ('w', 'a'))
         self._handle.root._v_attrs.application = str(value)
 
     #####################################################
@@ -328,12 +283,16 @@ class HDF5TrajectoryFile(object):
                 except KeyError:
                     resSeq = None
                     warnings.warn('No resSeq information found in HDF file, defaulting to zero-based indices')
-                residue = topology.add_residue(residue_dict['name'], chain, resSeq=resSeq)
+                try:
+                    segment_id = residue_dict["segmentID"]
+                except KeyError:
+                    segment_id = ""
+                residue = topology.add_residue(residue_dict['name'], chain, resSeq=resSeq, segment_id=segment_id)
                 for atom_dict in sorted(residue_dict['atoms'], key=operator.itemgetter('index')):
                     try:
                         element = elem.get_by_symbol(atom_dict['element'])
                     except KeyError:
-                        element = None
+                        element = elem.virtual
                     topology.add_atom(atom_dict['name'], element, residue)
 
         atoms = list(topology.atoms)
@@ -343,7 +302,6 @@ class HDF5TrajectoryFile(object):
         return topology
 
     @topology.setter
-    @ensure_mode('w', 'a')
     def topology(self, topology_object):
         """Set the topology in the file
 
@@ -352,6 +310,7 @@ class HDF5TrajectoryFile(object):
         topology_object : mdtraj.Topology
             A topology object
         """
+        _check_mode(self.mode, ('w', 'a'))
 
         # we want to be able to handle the simtk.openmm Topology object
         # here too, so if it's not an mdtraj topology we'll just guess
@@ -375,7 +334,8 @@ class HDF5TrajectoryFile(object):
                         'index': int(residue.index),
                         'name': str(residue.name),
                         'atoms': [],
-                        "resSeq": int(residue.resSeq)
+                        "resSeq": int(residue.resSeq),
+                        "segmentID": str(residue.segment_id)
                     }
 
                     for atom in residue.atoms:
@@ -431,9 +391,9 @@ class HDF5TrajectoryFile(object):
         return None
 
     @randomState.setter
-    @ensure_mode('w', 'a')
     def randomState(self, value):
         "Set the state of the creators internal random number generator at the start of the simulation"
+        _check_mode(self.mode, ('w', 'a'))
         self._handle.root._v_attrs.randomState = str(value)
 
     #####################################################
@@ -448,9 +408,9 @@ class HDF5TrajectoryFile(object):
         return None
 
     @forcefield.setter
-    @ensure_mode('w', 'a')
     def forcefield(self, value):
         "Set the description of the hamiltonian used. A short, human readable string, like AMBER99sbildn."
+        _check_mode(self.mode, ('w', 'a'))
         self._handle.root._v_attrs.forcefield = str(value)
 
     #####################################################
@@ -465,9 +425,9 @@ class HDF5TrajectoryFile(object):
         return None
 
     @reference.setter
-    @ensure_mode('w', 'a')
     def reference(self, value):
         "Set a published reference that documents the program or parameters used to generate the data"
+        _check_mode(self.mode, ('w', 'a'))
         self._handle.root._v_attrs.reference = str(value)
 
     #####################################################
@@ -491,7 +451,6 @@ class HDF5TrajectoryFile(object):
         return None
 
     @constraints.setter
-    @ensure_mode('w', 'a')
     def constraints(self, value):
         """Set the constraints applied to bond lengths
 
@@ -502,6 +461,8 @@ class HDF5TrajectoryFile(object):
             the index of the two atoms involved in the constraints and the
             distance of the constraint.
         """
+        _check_mode(self.mode, ('w', 'a'))
+
         dtype = np.dtype([
                 ('atom1', np.int32),
                 ('atom2', np.int32),
@@ -522,7 +483,49 @@ class HDF5TrajectoryFile(object):
     # read/write methods for file-like behavior
     #####################################################
 
-    @ensure_mode('r')
+    def read_as_traj(self, n_frames=None, stride=None, atom_indices=None):
+        """Read a trajectory from the HDF5 file
+
+        Parameters
+        ----------
+        n_frames : {int, None}
+            The number of frames to read. If not supplied, all of the
+            remaining frames will be read.
+        stride : {int, None}
+            By default all of the frames will be read, but you can pass this
+            flag to read a subset of of the data by grabbing only every
+            `stride`-th frame from disk.
+        atom_indices : {int, None}
+            By default all of the atom  will be read, but you can pass this
+            flag to read only a subsets of the atoms for the `coordinates` and
+            `velocities` fields. Note that you will have to carefully manage
+            the indices and the offsets, since the `i`-th atom in the topology
+            will not necessarily correspond to the `i`-th atom in your subset.
+
+        Returns
+        -------
+        trajectory : Trajectory
+            A trajectory object containing the loaded portion of the file.
+        """
+        _check_mode(self.mode, ('r',))
+
+        from mdtraj.core.trajectory import Trajectory
+        topology = self.topology
+        if atom_indices is not None:
+            topology = topology.subset(atom_indices)
+
+        initial = int(self._frame_index)
+        data = self.read(n_frames=n_frames, stride=stride, atom_indices=atom_indices)
+        if len(data) == 0:
+            return Trajectory(xyz=np.zeros((0, topology.n_atoms, 3)), topology=topology)
+
+        in_units_of(data.coordinates, self.distance_unit, Trajectory._distance_unit, inplace=True)
+        in_units_of(data.cell_lengths, self.distance_unit, Trajectory._distance_unit, inplace=True)
+
+        return Trajectory(xyz=data.coordinates, topology=topology, time=data.time,
+                          unitcell_lengths=data.cell_lengths,
+                          unitcell_angles=data.cell_angles)
+
     def read(self, n_frames=None, stride=None, atom_indices=None):
         """Read one or more frames of data from the file
 
@@ -559,6 +562,8 @@ class HDF5TrajectoryFile(object):
             n units of "nanometers", "picoseconds", "kelvin", "degrees" and
             "kilojoules_per_mole".
         """
+        _check_mode(self.mode, ('r',))
+
         if n_frames is None:
             n_frames = np.inf
         if stride is not None:
@@ -613,7 +618,6 @@ class HDF5TrajectoryFile(object):
         self._frame_index += (frame_slice.stop - frame_slice.start)
         return frames
 
-    @ensure_mode('w', 'a')
     def write(self, coordinates, time=None, cell_lengths=None, cell_angles=None,
                     velocities=None, kineticEnergy=None, potentialEnergy=None,
                     temperature=None, alchemicalLambda=None):
@@ -668,7 +672,7 @@ class HDF5TrajectoryFile(object):
             You may optionally specify the alchemical lambda in each frame. These
             have no units, but are generally between zero and one.
         """
-
+        _check_mode(self.mode, ('w', 'a'))
 
         # these must be either both present or both absent. since
         # we're going to throw an error if one is present w/o the other,
@@ -853,7 +857,6 @@ class HDF5TrajectoryFile(object):
                 atom=self.tables.Float32Atom(), shape=(0,))
             self._get_node('/', name='lambda').attrs['units'] = 'dimensionless'
 
-    @ensure_mode('r')
     def seek(self, offset, whence=0):
         """Move to a new file position
 
@@ -867,6 +870,8 @@ class HDF5TrajectoryFile(object):
             2: move relative to the end of file, offset should be <= 0.
             Seeking beyond the end of a file is not supported
         """
+        _check_mode(self.mode, ('r',))
+
         if whence == 0 and offset >= 0:
             self._frame_index = offset
         elif whence == 1:
@@ -887,7 +892,7 @@ class HDF5TrajectoryFile(object):
         return int(self._frame_index)
 
     def _validate(self):
-        raise NotImplemented
+        raise NotImplementedError()
 
         # check that all of the shapes are consistent
         # check that everything has units
@@ -949,3 +954,9 @@ class HDF5TrajectoryFile(object):
         if not self._open:
             raise ValueError('I/O operation on closed file')
         return len(self._handle.root.coordinates)
+
+
+def _check_mode(m, modes):
+    if m not in modes:
+        raise ValueError('This operation is only available when a file '
+                         'is open in mode="%s".' % m)

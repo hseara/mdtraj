@@ -26,15 +26,13 @@
 # Imports
 ##############################################################################
 
-import cython
-cimport cython
 import os
 import numpy as np
 cimport numpy as np
 np.import_array()
 from mdtraj.utils import ensure_type, cast_indices, in_units_of
 from mdtraj.utils.six import string_types
-from mdtraj.formats.registry import _FormatRegistry
+from mdtraj.formats.registry import FormatRegistry
 from libc.stdlib cimport malloc, free
 from libc.string cimport strcpy, strlen
 from dcdlib cimport molfile_timestep_t, dcdhandle
@@ -69,7 +67,7 @@ cdef ERROR_MESSAGES = {
 # Code
 ##############################################################################
 
-@_FormatRegistry.register_loader('.dcd')
+@FormatRegistry.register_loader('.dcd')
 def load_dcd(filename, top=None, stride=None, atom_indices=None, frame=None):
     """load_dcd(filename, top=None, stride=None, atom_indices=None, frame=None)
 
@@ -118,7 +116,7 @@ def load_dcd(filename, top=None, stride=None, atom_indices=None, frame=None):
     --------
     mdtraj.DCDTrajectoryFile :  Low level interface to DCD files
     """
-    from mdtraj.core.trajectory import _parse_topology, Trajectory
+    from mdtraj.core.trajectory import _parse_topology
 
     # we make it not required in the signature, but required here. although this
     # is a little wierd, its good because this function is usually called by a
@@ -126,36 +124,20 @@ def load_dcd(filename, top=None, stride=None, atom_indices=None, frame=None):
     # we want to give the user an informative error message
     if top is None:
         raise ValueError('"top" argument is required for load_dcd')
-
     if not isinstance(filename, string_types):
-        raise TypeError('filename must be of type string for load_trr. '
+        raise TypeError('filename must be of type string for load_dcd. '
             'you supplied %s' % type(filename))
 
     topology = _parse_topology(top)
     atom_indices = cast_indices(atom_indices)
-    if atom_indices is not None:
-        topology = topology.subset(atom_indices)
 
     with DCDTrajectoryFile(filename) as f:
         if frame is not None:
             f.seek(frame)
-            xyz, box_length, box_angle = f.read(n_frames=1, atom_indices=atom_indices)
+            n_frames = 1
         else:
-            xyz, box_length, box_angle = f.read(stride=stride, atom_indices=atom_indices)
-
-        in_units_of(xyz, f.distance_unit, Trajectory._distance_unit, inplace=True)
-        in_units_of(box_length, f.distance_unit, Trajectory._distance_unit, inplace=True)
-
-    time = np.arange(len(xyz))
-    if frame is not None:
-        time += frame
-    elif stride is not None:
-        time *= stride
-
-    trajectory = Trajectory(xyz=xyz, topology=topology, time=time,
-                            unitcell_lengths=box_length,
-                            unitcell_angles=box_angle)
-    return trajectory
+            n_frames = None
+        return f.read_as_traj(topology, n_frames=n_frames, stride=stride, atom_indices=atom_indices)
 
 
 cdef class DCDTrajectoryFile:
@@ -188,15 +170,15 @@ cdef class DCDTrajectoryFile:
     >>> f.close()
 
     >>> # read all of the data with automatic closing of the file
-    >>> with DCDTrajectoryFile('mytrajectory.dcd') as f:
+    >>> with DCDTrajectoryFile('mytrajectory.dcd', 'r') as f:
     >>>    xyz, cell_lengths, cell_angles = f.read()
 
     >>> # write some xyz coordinates to a new file
-    >>> with DCDTrajectoryFile('mytrajectory2.dcd. 'w') as f:
+    >>> with DCDTrajectoryFile('mytrajectory2.dcd', 'w') as f:
     >>>     f.write(np.random.randn(10,3,3))
 
     >>> # write frames one at a time
-    >>> with DCDTrajectoryFile('mytrajectory2.dcd. 'w') as f:
+    >>> with DCDTrajectoryFile('mytrajectory2.dcd', 'w') as f:
     >>>     n_frames, n_atoms = 5, 10
     >>>     for i in range(n_frames):
     >>>         f.write(np.random.randn(n_atoms, 3))
@@ -368,6 +350,50 @@ cdef class DCDTrajectoryFile:
             raise ValueError('I/O operation on closed file')
         return dcd_nsets(self.fh)
 
+    def read_as_traj(self, topology, n_frames=None, stride=None, atom_indices=None):
+        """read_as_traj(topology, n_frames=None, stride=None, atom_indices=None)
+
+        Read a trajectory from an XTC file
+
+        Parameters
+        ----------
+        topology : Topology
+            The system topology
+        n_frames : int, optional
+            If positive, then read only the next `n_frames` frames. Otherwise read all
+            of the frames in the file.
+        stride : np.ndarray, optional
+            Read only every stride-th frame.
+        atom_indices : array_like, optional
+            If not none, then read only a subset of the atoms coordinates from the
+            file. This may be slightly slower than the standard read because it required
+            an extra copy, but will save memory.
+
+        Returns
+        -------
+        trajectory : Trajectory
+            A trajectory object containing the loaded portion of the file.
+        """
+        from mdtraj.core.trajectory import Trajectory
+        if atom_indices is not None:
+            topology = topology.subset(atom_indices)
+
+        initial = int(self.frame_counter)
+        xyz, box_length, box_angle = self.read(n_frames=n_frames, stride=stride, atom_indices=atom_indices)
+        if len(xyz) == 0:
+            return Trajectory(xyz=np.zeros((0, topology.n_atoms, 3)), topology=topology)
+
+        in_units_of(xyz, self.distance_unit, Trajectory._distance_unit, inplace=True)
+        in_units_of(box_length, self.distance_unit, Trajectory._distance_unit, inplace=True)
+
+        if stride is None:
+            stride = 1
+        time = (stride*np.arange(len(xyz))) + initial
+
+        return Trajectory(xyz=xyz, topology=topology, time=time,
+                          unitcell_lengths=box_length,
+                          unitcell_angles=box_angle)
+
     def read(self, n_frames=None, stride=None, atom_indices=None):
         """read(n_frames=None, stride=None, atom_indices=None)
 
@@ -502,16 +528,16 @@ cdef class DCDTrajectoryFile:
         Parameters
         ----------
         xyz : np.ndarray, shape=(n_frames, n_atoms, 3)
-            The cartesian coordinates of the atoms to write. By convention, the
-            lengths should be in units of angstroms.
+            The cartesian coordinates of the atoms to write. By convention for
+            this trajectory format, the lengths should be in units of angstroms.
         cell_lengths : np.ndarray, shape=(n_frames, 3), dtype=float32, optional
             The length of the periodic box in each frame, in each direction,
-            `a`, `b`, `c`. By convention the lengths should be in units
-            of angstroms.
+            `a`, `b`, `c`. By convention for
+            this trajectory format, the lengths should be in units of angstroms.
         cell_angles : np.ndarray, shape=(n_frames, 3), dtype=float32, optional
             Organized analogously to cell_lengths. Gives the alpha, beta and
-            gamma angles respectively. By convention, the angles should be
-            in units of degrees.
+            gamma angles respectively. By convention for
+            this trajectory format, the angles should be in units of degrees.
         """
         if str(self.mode) != 'w':
             raise ValueError('write() is only available when the file is opened in mode="w"')
@@ -579,4 +605,4 @@ cdef class DCDTrajectoryFile:
 
             if status != _DCD_SUCCESS:
                 raise IOError("DCD Error: %s" % ERROR_MESSAGES(status))
-_FormatRegistry.register_fileobject('.dcd')(DCDTrajectoryFile)
+FormatRegistry.register_fileobject('.dcd')(DCDTrajectoryFile)

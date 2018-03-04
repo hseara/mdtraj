@@ -4,7 +4,7 @@
 # Copyright 2012-2013 Stanford University and the Authors
 #
 # Authors: Christoph Klein
-# Contributors:
+# Contributors: Robert T. McGibbon
 #
 # MDTraj is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License as
@@ -34,7 +34,7 @@ import numpy as np
 
 from mdtraj.utils import (ensure_type, cast_indices, in_units_of,
                           lengths_and_angles_to_box_vectors)
-from mdtraj.formats.registry import _FormatRegistry
+from mdtraj.formats.registry import FormatRegistry
 from mdtraj.utils.six import string_types
 from mdtraj.utils.six.moves import xrange
 
@@ -45,7 +45,7 @@ class _EOF(IOError):
     pass
 
 
-@_FormatRegistry.register_loader('.lammpstrj')
+@FormatRegistry.register_loader('.lammpstrj')
 def load_lammpstrj(filename, top=None, stride=None, atom_indices=None,
                    frame=None, unit_set='real'):
     """Load a LAMMPS trajectory file.
@@ -81,7 +81,7 @@ def load_lammpstrj(filename, top=None, stride=None, atom_indices=None,
     --------
     mdtraj.LAMMPSTrajectoryFile :  Low level interface to lammpstrj files
     """
-    from mdtraj.core.trajectory import _parse_topology, Trajectory
+    from mdtraj.core.trajectory import _parse_topology
 
     # We make `top` required. Although this is a little weird, its good because
     # this function is usually called by a dispatch from load(), where top comes
@@ -89,15 +89,12 @@ def load_lammpstrj(filename, top=None, stride=None, atom_indices=None,
     # informative error message.
     if top is None:
         raise ValueError('"top" argument is required for load_lammpstrj')
-
     if not isinstance(filename, string_types):
         raise TypeError('filename must be of type string for load_lammpstrj. '
                         'you supplied %s'.format(type(filename)))
 
     topology = _parse_topology(top)
     atom_indices = cast_indices(atom_indices)
-    if atom_indices is not None:
-        topology = topology.subset(atom_indices)
 
     with LAMMPSTrajectoryFile(filename) as f:
         # TODO: Support other unit sets.
@@ -107,25 +104,14 @@ def load_lammpstrj(filename, top=None, stride=None, atom_indices=None,
             raise ValueError('Unsupported unit set specified: {0}.'.format(unit_set))
         if frame is not None:
             f.seek(frame)
-            xyz, cell_lengths, cell_angles = f.read(n_frames=1, atom_indices=atom_indices)
+            n_frames = 1
         else:
-            xyz, cell_lengths, cell_angles = f.read(stride=stride, atom_indices=atom_indices)
+            n_frames = None
 
-        in_units_of(xyz, f.distance_unit, Trajectory._distance_unit, inplace=True)
-
-    time = np.arange(len(xyz))
-    if frame is not None:
-        time += frame
-    elif stride is not None:
-        time *= stride
-
-    t = Trajectory(xyz=xyz, topology=topology, time=time)
-    t.unitcell_lengths = cell_lengths
-    t.unitcell_angles = cell_angles
-    return t
+        return f.read_as_traj(topology, n_frames=n_frames, stride=stride, atom_indices=atom_indices)
 
 
-@_FormatRegistry.register_fileobject('.lammpstrj')
+@FormatRegistry.register_fileobject('.lammpstrj')
 class LAMMPSTrajectoryFile(object):
     """Interface for reading and writing to a LAMMPS lammpstrj files.
     This is a file-like object, that both reading or writing depending
@@ -162,8 +148,8 @@ class LAMMPSTrajectoryFile(object):
             self._fh = open(filename, 'r')
             self._is_open = True
         elif mode == 'w':
-            if os.path.exists(filename) and not force_overwrite:
-                raise IOError("The file '%s' already exists" % filename)
+            if not force_overwrite and os.path.exists(filename):
+                raise IOError('"%s" already exists' % filename)
             self._fh = open(filename, 'w')
             self._is_open = True
         else:
@@ -187,6 +173,66 @@ class LAMMPSTrajectoryFile(object):
         """Support the context manager protocol. """
         self.close()
 
+    def read_as_traj(self, topology, n_frames=None, stride=None, atom_indices=None):
+        """Read a trajectory from a lammpstrj file
+
+        Parameters
+        ----------
+        topology : Topology
+            The system topology
+        n_frames : int, optional
+            If positive, then read only the next `n_frames` frames. Otherwise read all
+            of the frames in the file.
+        stride : np.ndarray, optional
+            Read only every stride-th frame.
+        atom_indices : array_like, optional
+            If not none, then read only a subset of the atoms coordinates from the
+            file. This may be slightly slower than the standard read because it required
+            an extra copy, but will save memory.
+
+        Returns
+        -------
+        trajectory : Trajectory
+            A trajectory object containing the loaded portion of the file.
+
+        See Also
+        --------
+        read : Returns the raw data from the file
+
+        Notes
+        -----
+        If coordinates are specified in more than one style, the first complete
+        trio of x/y/z coordinates will be read in according to the following
+        order:
+            1) x,y,z (unscaled coordinates)
+            2) xs,ys,zs (scaled atom coordinates)
+            3) xu,yu,zu (unwrapped atom coordinates)
+            4) xsu,ysu,zsu (scaled unwrapped atom coordinates)
+
+        E.g., if the file contains x, y, z, xs, ys, zs then x, y, z will be used.
+              if the file contains x, y, xs, ys, zs then xs, ys, zs will be used.
+        """
+        from mdtraj.core.trajectory import Trajectory
+        if atom_indices is not None:
+            topology = topology.subset(atom_indices)
+
+        initial = int(self._frame_index)
+        xyz, cell_lengths, cell_angles = self.read(n_frames=n_frames, stride=stride, atom_indices=atom_indices)
+        if len(xyz) == 0:
+            return Trajectory(xyz=np.zeros((0, topology.n_atoms, 3)), topology=topology)
+
+        in_units_of(xyz, self.distance_unit, Trajectory._distance_unit, inplace=True)
+        in_units_of(cell_lengths, self.distance_unit, Trajectory._distance_unit, inplace=True)
+
+        if stride is None:
+            stride = 1
+        time = (stride*np.arange(len(xyz))) + initial
+
+        t = Trajectory(xyz=xyz, topology=topology, time=time)
+        t.unitcell_lengths = cell_lengths
+        t.unitcell_angles = cell_angles
+        return t
+
     def read(self, n_frames=None, stride=None, atom_indices=None):
         """Read data from a lammpstrj file.
 
@@ -204,10 +250,12 @@ class LAMMPSTrajectoryFile(object):
         Returns
         -------
         xyz : np.ndarray, shape=(n_frames, n_atoms, 3), dtype=np.float32
-        cell_lengths : {np.ndarray, None}
-            If the file contains unitcell lengths, they will be returned as an
-            array of shape=(n_frames, 3). Otherwise, unitcell_angles will be
-            None.
+        cell_lengths : np.ndarray, None
+            The lengths (a,b,c) of the unit cell for each frame, or None if
+            the information is not present in the file.
+        cell_angles : np.ndarray, None
+            The angles (\alpha, \beta, \gamma) defining the unit cell for
+            each frame, or None if  the information is not present in the file.
         """
         if not self._mode == 'r':
             raise ValueError('read() is only available when file is opened '
@@ -292,14 +340,12 @@ class LAMMPSTrajectoryFile(object):
             gamma = np.arccos(xy / b)
 
             lengths = np.array([a, b, c])
-            in_units_of(lengths, self.distance_unit, 'nanometers', inplace=True)
             angles = np.degrees(np.array([alpha, beta, gamma]))
         elif style == 'orthogonal':
             box[0] = self._fh.readline().split()  # x-dim of box
             box[1] = self._fh.readline().split()  # y-dim of box
             box[2] = self._fh.readline().split()  # z-dim of box
             lengths = np.diff(box, axis=1).reshape(1, 3)[0]  # box lengths
-            in_units_of(lengths, self.distance_unit, 'nanometers', inplace=True)
             angles = np.empty(3)
             angles.fill(90.0)
         return lengths, angles
@@ -327,7 +373,31 @@ class LAMMPSTrajectoryFile(object):
                           'lammpstrj file.'.format(
                     self._line_counter,  self._filename))
 
-        self._fh.readline()  # ITEM: ATOMS ...
+        column_headers = self._fh.readline().split()[2:]  # ITEM: ATOMS ...
+        if self._frame_index == 0:
+            # Detect which columns the atom index, type and coordinates are.
+            columns = {header: idx for idx, header in enumerate(column_headers)}
+
+            # Make sure the file contains an x, y, and z-coordinate of the same
+            # style.
+            coord_keywords = [('x', 'y', 'z'),  # unscaled
+                              ('xs', 'ys', 'zs'),  # scaled
+                              ('xu', 'yu', 'zu'),  # unwrapped
+                              ('xsu', 'ysu', 'zsu')]  # scaled and unwrapped
+            for keywords in coord_keywords:
+                if set(keywords).issubset(column_headers):
+                    break
+            else:
+                raise IOError('Invalid .lammpstrj file. Must contain x, y, and '
+                              'z coordinates that all adhere to the same style.')
+
+            try:
+                self._atom_index_column = columns['id']
+                self._atom_type_column = columns['type']
+                self._xyz_columns = [columns[keywords[0]], columns[keywords[1]], columns[keywords[2]]]
+            except KeyError:
+                raise IOError("Invalid .lammpstrj file. Must contain 'id', "
+                              "'type', 'x*', 'y*' and 'z*' entries.")
         self._line_counter += 4
         # --- end header ---
 
@@ -339,11 +409,11 @@ class LAMMPSTrajectoryFile(object):
             line = self._fh.readline()
             if line == '':
                 raise _EOF()
-            temp = line.split()
+            split_line = line.split()
             try:
-                atom_index = int(temp[0])
-                types[atom_index - 1] = int(temp[1])
-                xyz[atom_index - 1] = [float(x) for x in temp[2:5]]
+                atom_index = int(split_line[self._atom_index_column])
+                types[atom_index - 1] = int(split_line[self._atom_type_column])
+                xyz[atom_index - 1] = [float(split_line[column]) for column in self._xyz_columns]
             except Exception:
                 raise IOError('lammpstrj parse error on line {0:d} of "{1:s}". '
                               'This file does not appear to be a valid '
@@ -408,12 +478,14 @@ class LAMMPSTrajectoryFile(object):
         Parameters
         ----------
         xyz : np.ndarray, shape=(n_frames, n_atoms, 3)
-            The cartesian coordinates of the atoms to write.
+            The cartesian coordinates of the atoms to write. By convention,
+            the lengths should be in units of angstroms.
         cell_lengths : np.ndarray, dtype=np.double, shape=(n_frames, 3)
-            The lengths (a,b,c) of the unit cell for each frame.
+            The lengths (a,b,c) of the unit cell for each frame. By convention,
+            the lengths should be in units of angstroms.
         cell_angles : np.ndarray, dtype=np.double, shape=(n_frames, 3)
             The angles (\alpha, \beta, \gamma) defining the unit cell for
-            each frame.
+            each frame. (Units of degrees).
         types : np.ndarray, shape(3, ), dtype=int
             The numeric type of each particle.
         unit_set : str, optional
@@ -449,8 +521,6 @@ class LAMMPSTrajectoryFile(object):
             self.distance_unit == 'angstroms'
         else:
             raise ValueError('Unsupported unit set specified: {0}.'.format(unit_set))
-        in_units_of(xyz, 'nanometers', self.distance_unit, inplace=True)
-        in_units_of(cell_lengths, 'nanometers', self.distance_unit, inplace=True)
 
         for i in range(xyz.shape[0]):
             # --- begin header ---

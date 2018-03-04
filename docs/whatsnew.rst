@@ -1,13 +1,193 @@
-***********
 What's New?
-***********
+===========
 
 These are new features and improvements of note in each release.
 
-
-v1.4 (Development)
+v2.0 (Development)
 ------------------
-- New function to calculate nematic order parameters (``compute_nematic_order``) (Christoph Klein)
+
+This is the current development version of MDTraj. 
+Despite the major version number increase, this release
+will maintain backwards compatibility with version 1.x
+
+v1.9 (September 3, 2017)
+------------------------
+
+- [xtc] ``approx_nframes`` returns at least one (#1265)
+- Make ``compute_directors`` user-facing (#1260)
+- Add differentiable contacts option (#1247)
+- Remove link to forum (#1237)
+- Skip renumbering if no bonds in mol2 (#1238)
+- Add a bunch of Van Der Waals values (#1174)
+- [geometry] Fix compatibility with old visual studio for Python 2.7 (#1233)
+- Implement ``compute_average_structure`` (#1221)
+- Fix import of ``load_stk`` (#1231)
+- Fix bugs in load with atom_indices and frame args (#1227)
+- Fix conda test running (#1228)
+- Amber restart file convention (#1223)
+- Install path for zlib on linux too (#1208)
+- Fix transform calculation and Transform object to be more general (#1254)
+- Add O1 as alternative definition for water oxygen (#1257)
+- Fix precentering overflow error in center.c (#1283)
+- Add chi5 angle computation (#1291)
+- Fix the build bug caused by incorrect plumbing of the numpy include path
+- into ``cflags`` (#1290)
+- Make RDF ``pairs`` argument required (#1288)
+- Refresh tests (#1266)
+- Remove PyPI downloads badge (#1293)
+- Extracting velocities/forces from TRR files (hidden API) (#1294)
+- Add "in" selection to selection language (#1268)
+- Handle a single frame being passed to sparta+ (#1295)
+
+v1.8 (November 9, 2016)
+-----------------------
+
+- PR #1202: ``mdtraj.html`` has been removed. We recommend using
+  ``nglview`` for visualizing MDTraj trajectory objects.
+- PR #1204: Fix search functionality with docs
+- PR #1167: Fix corner case in distancekernel.h
+- PR #1190: Fix issue with rmsd precentered = True and atom_indices != None
+- PR #1106: Speed up image_molecules
+- PR #1182: Add 'sidechain' and 'sidechain-heavy' options to compute_contacts
+- PR #1180: Handle unexpected keyword arguments gracefully in psf and prmtop parsers
+- PR #1171: Remove unnecessary restriction on iterload
+- PR #1170: Load single-element path lists without a copy
+- PR #1165: There should never be zero bins in Voxels class
+- PR #1158: Update deprecated use of scipy.stats.nanmean
+- PR #1153: [formats/XTC] in case of an out of bounds seek, raise IOError
+- PR #1161: Fix typos in examples
+- PR #1130: Automatically test examples to make sure they work
+- PR #1155: Update wording for simulation-with-openmm.ipynb
+- PR #1146: Ensure box vectors have right dtype
+- PR #1145: Check that file exists before trying to open it
+- PR #1139: Optimize baker_hubbard and wernet_nilsson functions
+- PR #1137: Allow standard_names as a keyword argument to md.load()
+- PR #1132: Fix bug in hoomdxml reader
+- PR #1125: Support Gromacs TNG files
+- PR #1123: Add md.join(trajs)
+
+v1.7.2 (May 2, 2016)
+--------------------
+
+- Small fix to developer tools so docs get uploaded.
+
+v1.7 (May 2, 2016)
+------------------
+
+We're please to announce the release of MDTraj 1.7. In addition to the
+usual fixes and improvements, MDTraj has gained the ability to image
+molecules in trajectories. So far, it's worked very well even on
+complicated systems like multi-molecule proteins. Look forward to future
+enhancements to this new feature! Some other highlights include:
+
+- New ``compute_neighborlist()`` function (#1057)
+- Add option to skip standardization of atom and residue names during
+  ``load_pdb`` (#1061)
+- Function for imaging molecules (#1058)
+- New optional argument ``periodic`` for ``compute_contacts`` (#1072)
+- Refresh documentation (#1067, #1074, #1075)
+- Rewrite geometry code in modern c++ (#1077)
+- Fix issue with ``Topoplogy.from_openmm`` (#1089)
+
+
+v1.6 (February 15, 2016)
+------------------------
+
+MDTraj 1.6 contains a good mix of bug fixes and enhancements. Some
+highlights include:
+
+- Improved performance for ``compute_contacts`` (#995)
+- Improved performance for ``Topology.select_pairs`` (#1000)
+- Fast random access to xtc and trr files (#1038)
+- xyz files support the ``__len__`` attribute (#998)
+- ``segment_id`` is a new residue attribute (#1002)
+- Expose ``FormatRegistry`` as a public api (#1039)
+- Perform a heuristic check for valid unit cells when reading pdb files (#974)
+- pdb file parsing uses the last model ``CONNECT`` records for bonds, not the first (#980)
+- No longer force all warnings to be emitted (#1013 #1030)
+- Always respect the ``force_overwrite`` argument in save methods (#878)
+- Fix interop with ``scipy.cluster`` (#997)
+- ``formats.hdf5.ensure_mode`` was removed (#990)
+
+
+v1.5.1 (November 6, 2015)
+-------------------------
+
+MDTraj 1.5.1 is a small bugfix release to correct two issues introduced in the
+immediately preceeding 1.5.0 release.
+
+- A recent change (merged Nov 5) caused ``compute_chi4`` to compute chi3
+  angles (#981).
+- Revert changes in setup.py that resulted in a more confusing error when
+  cython is not installed at build-time (#985).
+
+
+v1.5 (November 6, 2015)
+-----------------------
+
+We're pleased to announce the 1.5 release of MDTraj. It contains new
+features, improvements, and bug fixes. Highlights of the changes for this
+version include:
+
+- Faster histogramming method in RDF calculations when supported by numpy (#952)
+- Improved support for mol2 reading (#945)
+- Support for IPython/Jupyter 4 (#935)
+- Improved support for Amber NetCDF writing (#939)
+- Fix handling of periodic boundaries for distance calculations for general triclinic unit cells (#930)
+- Support different reference and query indices for superposition and RMSD calculation (#915)
+- Fix dcd reading bug under Windows (#905)
+- Trajectories have a hash implementation (#898)
+- Fixes for Hoomd (#900, #885)
+- Support files (``devtools/``, ``setup.py``, ``.travis.yml``) are BSD licensed (#891, #893)
+- Fixes for Lammpstrj (#861)
+- Support for one letter amino acid codes (#871)
+- Trajectory smoothing using a Buttersworth filter (#962)
+- New functions for computing dihedral indices from a topology (#972)
+- Improvements to build process (#955, #954, #941, #943, #942, #934)
+
+
+v1.4.2 (June 9, 2015)
+---------------------
+- BUGFIX: Fix pytables inadvertently being moved to a required dependency
+
+
+v1.4 (June 8, 2015)
+-------------------
+Version 1.4 is our best release yet! It contains many new features, performance improvements, and bug fixes.
+
+Major highlights include:
+
+- New function to calculate nematic order parameters (``compute_nematic_order``).
+- Improved efficiency of generating RDF pairs.
+- Add support for XYZ-format files.
+- Fix parsing error with certain mol2 files.
+- Support .pdb.gz files and make loading multiple pdb files more efficient.
+- Fix use-after-free bug with DCD causing incorrect filenames.
+- Update IPython-notebook trajectory viewer for IPython 3.0.
+- Add support for the HOOMD-Blue XML topology format.
+- Make virtual sites a new "element".
+- Add 'NA' code to dssp for non-protein residues.
+- Add support for CHARMM (Chamber) topologies in prmtop loader.
+- Add methods to calculate more NMR J-couplings.
+- Fix gro file unitcell handling.
+- Enable .lammpstrj to parse custom column orders.
+- Add read_as_traj method to all TrajectoryFile classes, making iterload work for all formats.
+
+A total of 10 people contributed to this release.
+People with a "+" by their names contributed a patch for the first time.
+
+Authors
+~~~~~~~
+* Kyle A. Beauchamp
+* Anton Goloborodko +
+* Matthew Harrigan
+* Christoph Klein
+* Robert T. McGibbon
+* Tim Moore +
+* Patrick Riley +
+* Jason Swails
+* Lee-Ping Wang
+* Andrea Zonca +
 
 
 v1.3 (February 25, 2015)
@@ -79,7 +259,7 @@ for contributions.
 
 
 v0.9.0 (June 10, 2014)
------------------------
+----------------------
 - Brand new ``nmr`` library that includes transparent python interfaces to
   SHIFTX2, PPM and SPARTA+ for chemical shifts, as a library for scalar
   couplings (J) using the Karplus relation.
@@ -180,3 +360,5 @@ v0.5.0 (January 3, 2014)
 - Full support for computing all of the chi angles
 - Add seek/tell methods to all of the trajectory file objects
 - New top level memory efficient ``iterload`` method for chunked trajectory loading
+
+.. vim: tw=75

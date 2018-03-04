@@ -1,9 +1,11 @@
-matplotlib
 sphinx
-boto
-ipython-notebook
+matplotlib
+jupyter
 jinja2
 runipy
 openmm
 pytables
 scikit-learn
+nose
+pandas
+numpydoc

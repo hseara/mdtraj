@@ -2,7 +2,7 @@
 
 .. currentmodule:: mdtraj
 
-Analysis Functions
+Analysis Reference
 ==================
 
 Trajectory analysis is the heart of MDTraj. These functions can be used to run
@@ -10,7 +10,7 @@ a variety of analyses on :class:`mdtraj.Trajectory` objects.
 It's usually as simple as ::
 
     >>> import mdtraj as md
-    >>> t = md.load('trajectory.pdb)
+    >>> t = md.load('trajectory.pdb')
     >>> print(md.compute_phi(t))
 
 Root-mean-square deviation (RMSD)
@@ -41,14 +41,14 @@ Secondary Structure
     compute_dssp
 
 
-Surface Area and Radius of Gyration
------------------------------------
+Surface Area, Radius of Gyration and Inertia
+--------------------------------------------
 .. autosummary::
     :toctree: api/generated/
 
     shrake_rupley
     compute_rg
-
+    compute_inertia_tensor
 
 Distances
 ---------
@@ -87,6 +87,9 @@ NMR Observables
 .. autosummary::
     :toctree: api/generated/
 
+    compute_J3_HN_C
+    compute_J3_HN_CB
+    compute_J3_HN_HA
     chemical_shifts_shiftx2
     chemical_shifts_ppm
     chemical_shifts_spartaplus
@@ -110,3 +113,4 @@ Order Parameters
     :toctree: api/generated/
 
     compute_nematic_order
+    compute_directors

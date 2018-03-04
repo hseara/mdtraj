@@ -161,7 +161,7 @@ def _parse_psf_section(psf):
             line = psf.readline().strip()
     return title, pointers, data
     
-def load_psf(fname):
+def load_psf(fname, **kwargs):
     """Load a CHARMM or XPLOR PSF file from disk
 
     Parameters
@@ -237,7 +237,7 @@ def load_psf(fname):
                 rname = pdb.PDBTrajectoryFile._residueNameReplacements[rname]
             except KeyError:
                 pass
-            r = top.add_residue(rname, c, resid)
+            r = top.add_residue(rname, c, resid, segid)
 
         try:
             name = pdb.PDBTrajectoryFile._atomNameReplacements[rname][name]
@@ -258,7 +258,7 @@ def load_psf(fname):
         elif upper == 'CAL':
             element = elem.calcium
         elif mass == 0:
-            element = None
+            element = elem.virtual
         else:
             element = elem.Element.getByMass(mass*u.dalton)
         top.add_atom(name, element, r)

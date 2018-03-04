@@ -4,7 +4,7 @@
 # Copyright 2012-2015 Stanford University and the Authors
 #
 # Authors: Christoph Klein
-# Contributors:
+# Contributors: Robert T. McGibbon
 #
 # MDTraj is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License as
@@ -33,8 +33,9 @@ import os
 
 import numpy as np
 
-from mdtraj.formats.registry import _FormatRegistry
-from mdtraj.utils import cast_indices, in_units_of, ensure_type
+from mdtraj.formats.registry import FormatRegistry
+from mdtraj.utils import (cast_indices, in_units_of, ensure_type,
+                          open_maybe_zipped)
 from mdtraj.utils.six import string_types
 from mdtraj.utils.six.moves import xrange
 from mdtraj.version import version
@@ -46,7 +47,8 @@ class _EOF(IOError):
     pass
 
 
-@_FormatRegistry.register_loader('.xyz')
+@FormatRegistry.register_loader('.xyz')
+@FormatRegistry.register_loader('.xyz.gz')
 def load_xyz(filename, top=None, stride=None, atom_indices=None, frame=None):
     """Load a xyz trajectory file.
 
@@ -100,28 +102,19 @@ def load_xyz(filename, top=None, stride=None, atom_indices=None, frame=None):
 
     topology = _parse_topology(top)
     atom_indices = cast_indices(atom_indices)
-    if atom_indices is not None:
-        topology = topology.subset(atom_indices)
 
     with XYZTrajectoryFile(filename) as f:
         if frame is not None:
             f.seek(frame)
-            xyz = f.read(n_frames=1, atom_indices=atom_indices)
+            n_frames = 1
         else:
-            xyz = f.read(stride=stride, atom_indices=atom_indices)
-        in_units_of(xyz, f.distance_unit, Trajectory._distance_unit, inplace=True)
-
-    time = np.arange(len(xyz))
-    if frame is not None:
-        time += frame
-    elif stride is not None:
-        time *= stride
-
-    t = Trajectory(xyz=xyz, topology=topology, time=time)
-    return t
+            n_frames = None
+        return f.read_as_traj(topology, n_frames=n_frames, stride=stride,
+                              atom_indices=atom_indices)
 
 
-@_FormatRegistry.register_fileobject('.xyz')
+@FormatRegistry.register_fileobject('.xyz')
+@FormatRegistry.register_fileobject('.xyz.gz')
 class XYZTrajectoryFile(object):
     """Interface for reading and writing to xyz files.
 
@@ -149,19 +142,16 @@ class XYZTrajectoryFile(object):
         self._filename = filename
         self._mode = mode
         self._frame_index = 0
+        self._n_frames = None
         # track which line we're on. this is not essential, but its useful
         # when reporting errors to the user to say what line it occured on.
         self._line_counter = 0
 
         if mode == 'r':
-            if not os.path.exists(filename):
-                raise IOError("The file '%s' doesn't exist" % filename)
-            self._fh = open(filename, 'r')
+            self._fh = open_maybe_zipped(filename, 'r')
             self._is_open = True
         elif mode == 'w':
-            if os.path.exists(filename) and not force_overwrite:
-                raise IOError("The file '%s' already exists" % filename)
-            self._fh = open(filename, 'w')
+            self._fh = open_maybe_zipped(filename, 'w', force_overwrite)
             self._is_open = True
         else:
             raise ValueError('mode must be one of "r" or "w". '
@@ -183,6 +173,44 @@ class XYZTrajectoryFile(object):
     def __exit__(self, *exc_info):
         """Support the context manager protocol. """
         self.close()
+
+    def read_as_traj(self, topology, n_frames=None, stride=None, atom_indices=None):
+        """Read a trajectory from a XYZ file
+
+        Parameters
+        ----------
+        topology : Topology
+            The system topology
+        n_frames : int, optional
+            If positive, then read only the next `n_frames` frames. Otherwise read all
+            of the frames in the file.
+        stride : np.ndarray, optional
+            Read only every stride-th frame.
+        atom_indices : array_like, optional
+            If not none, then read only a subset of the atoms coordinates from the
+            file. This may be slightly slower than the standard read because it required
+            an extra copy, but will save memory.
+
+        Returns
+        -------
+        trajectory : Trajectory
+            A trajectory object containing the loaded portion of the file.
+        """
+        from mdtraj.core.trajectory import Trajectory
+        if atom_indices is not None:
+            topology = topology.subset(atom_indices)
+
+        initial = int(self._frame_index)
+        xyz = self.read(n_frames=n_frames, stride=stride, atom_indices=atom_indices)
+        if len(xyz) == 0:
+            return Trajectory(xyz=np.zeros((0, topology.n_atoms, 3)), topology=topology)
+
+        in_units_of(xyz, self.distance_unit, Trajectory._distance_unit, inplace=True)
+
+        if stride is None:
+            stride = 1
+        time = (stride*np.arange(len(xyz))) + initial
+        return Trajectory(xyz=xyz, topology=topology, time=time)
 
     def read(self, n_frames=None, stride=None, atom_indices=None):
         """Read data from a xyz file.
@@ -274,7 +302,8 @@ class XYZTrajectoryFile(object):
         Parameters
         ----------
         xyz : np.ndarray, shape=(n_frames, n_atoms, 3)
-            The cartesian coordinates of the atoms to write.
+            The cartesian coordinates of the atoms to write. By convention for
+            this trajectory format, the lengths should be in units of angstroms.
         types : np.ndarray, shape(3, )
             The type of each particle.
         """
@@ -289,7 +318,6 @@ class XYZTrajectoryFile(object):
         xyz = ensure_type(xyz, np.float32, 3, 'xyz', can_be_none=False,
                         shape=(None, None, 3), warn_on_cast=False,
                         add_newaxis_on_deficient_ndim=True)
-        in_units_of(xyz, 'nanometers', self.distance_unit, inplace=True)
 
         for i in range(xyz.shape[0]):
             self._fh.write('{0}\n'.format(xyz.shape[1]))
@@ -356,6 +384,12 @@ class XYZTrajectoryFile(object):
 
     def __len__(self):
         """Number of frames in the file. """
-        raise NotImplementedError()
-
-
+        if str(self._mode) != 'r':
+            raise NotImplementedError('len() only available in mode="r" currently')
+        if not self._is_open:
+            raise ValueError('I/O operation on closed file')
+        if self._n_frames is None:
+            with open(self._filename) as fh:
+                n_atoms = int(fh.readline())
+                self._n_frames = (sum(1 for line in fh) + 1) // (n_atoms + 2)
+        return self._n_frames

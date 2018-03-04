@@ -30,7 +30,7 @@ from mdtraj.geometry.distance import compute_distances
 __all__ = ['compute_rdf']
 
 
-def compute_rdf(traj, pairs=None, r_range=None, bin_width=0.005, n_bins=None,
+def compute_rdf(traj, pairs, r_range=None, bin_width=0.005, n_bins=None,
                 periodic=True, opt=True):
     """Compute radial distribution functions for pairs in every frame.
 
@@ -38,7 +38,7 @@ def compute_rdf(traj, pairs=None, r_range=None, bin_width=0.005, n_bins=None,
     ----------
     traj : Trajectory
         Trajectory to compute radial distribution function in.
-    pairs : array-like, shape=(n_pairs, 2), dtype=int, optional, default=None
+    pairs : array-like, shape=(n_pairs, 2), dtype=int
         Each row gives the indices of two atoms.
     r_range : array-like, shape=(2,), optional, default=(0.0, 1.0)
         Minimum and maximum radii.
@@ -73,13 +73,12 @@ def compute_rdf(traj, pairs=None, r_range=None, bin_width=0.005, n_bins=None,
     if n_bins is not None:
         n_bins = int(n_bins)
         if n_bins <= 0:
-            raise ValueError('n_bins must be a positive integer')
-        bins = np.linspace(r_range[0], r_range[1], n_bins)
+            raise ValueError('`n_bins` must be a positive integer')
     else:
-        bins = np.arange(r_range[0], r_range[1] + bin_width, bin_width)
+        n_bins = int((r_range[1] - r_range[0]) / bin_width)
 
     distances = compute_distances(traj, pairs, periodic=periodic, opt=opt)
-    g_r, edges = np.histogram(distances, bins=bins)
+    g_r, edges = np.histogram(distances, range=r_range, bins=n_bins)
     r = 0.5 * (edges[1:] + edges[:-1])
 
     # Normalize by volume of the spherical shell.

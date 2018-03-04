@@ -28,18 +28,21 @@
 
 import os
 import warnings
-import cython
-cimport cython
+import xdrlib
 import numpy as np
 cimport numpy as np
 np.import_array()
+
 from mdtraj.utils import ensure_type, cast_indices, in_units_of
 from mdtraj.utils.six import string_types
-from mdtraj.formats.registry import _FormatRegistry
+from mdtraj.formats.registry import FormatRegistry
 cimport trrlib
+cimport xdrlib
+from libc.stdio cimport SEEK_SET, SEEK_CUR
+
+ctypedef np.npy_int64   int64_t
 
 __all__ = ['load_trr', 'TRRTrajectoryFile']
-
 
 ###############################################################################
 # globals
@@ -73,10 +76,10 @@ if sizeof(float) != sizeof(np.float32_t):
 # Code
 ###############################################################################
 
-@_FormatRegistry.register_loader('.trr')
+@FormatRegistry.register_loader('.trr')
 def load_trr(filename, top=None, stride=None, atom_indices=None, frame=None):
     """load_trr(filename, top=None, stride=None, atom_indices=None, frame=None)
-    
+
     Load a Gromacs TRR file from disk.
 
     The .trr format is a cross-platform compressed binary trajectory format
@@ -127,29 +130,22 @@ def load_trr(filename, top=None, stride=None, atom_indices=None, frame=None):
 
     if not isinstance(filename, string_types):
         raise TypeError('filename must be of type string for load_trr. '
-            'you supplied %s' % type(filename))
+                        'you supplied %s' % type(filename))
 
     topology = _parse_topology(top)
     atom_indices = cast_indices(atom_indices)
-    if atom_indices is not None:
-        topology = topology.subset(atom_indices)
-
-    with TRRTrajectoryFile(filename) as f:
+    with TRRTrajectoryFile(filename, 'r') as f:
         if frame is not None:
             f.seek(frame)
-            xyz, time, step, box, lambd = f.read(n_frames=1, atom_indices=atom_indices)
+            n_frames = 1
         else:
-            xyz, time, step, box, lambd = f.read(stride=stride, atom_indices=atom_indices)
+            n_frames = None
 
-        in_units_of(xyz, f.distance_unit, Trajectory._distance_unit, inplace=True)
-        in_units_of(box, f.distance_unit, Trajectory._distance_unit, inplace=True)
-
-    trajectory = Trajectory(xyz=xyz, topology=topology, time=time)
-    trajectory.unitcell_vectors = box
-    return trajectory
+        return f.read_as_traj(topology, n_frames=n_frames, stride=stride,
+                              atom_indices=atom_indices)
 
 
-cdef class TRRTrajectoryFile:
+cdef class TRRTrajectoryFile(object):
     """TRRTrajectoryFile(filename, mode='r', force_overwrite=True, **kwargs)
 
     Interface for reading and writing to a GROMACS TRR file.
@@ -186,7 +182,7 @@ cdef class TRRTrajectoryFile:
     Examples
     --------
     >>> # load up the data from a trr
-    >>> with XTCTrajectoryFile('traj.trr') as f:
+    >>> with TRRTrajectoryFile('traj.trr') as f:
     >>>    xyz, time, step, box, lambdas = f.read()
 
     See Also
@@ -196,16 +192,18 @@ cdef class TRRTrajectoryFile:
     cdef trrlib.XDRFILE* fh
     cdef str filename
     cdef int n_atoms          # number of atoms in the file
-    cdef unsigned long n_frames  # numnber of frames in the file, cached
-    cdef int frame_counter    # current position in the file, in read mode
-    cdef int is_open          # is the file handle currently open?
-    cdef int approx_n_frames  # appriximate number of frames in the file, as guessed based on its size
+    cdef int64_t n_frames  # numnber of frames in the file, cached
+    cdef int64_t frame_counter    # current position in the file, in read mode
+    cdef char is_open          # is the file handle currently open?
+    cdef int64_t approx_n_frames  # appriximate number of frames in the file, as guessed based on its size
     cdef char* mode           # mode in which the file is open, either 'r' or 'w'
     cdef int min_chunk_size
     cdef float chunk_size_multiplier
-    cdef int with_unitcell    # used in mode='w' to know if we're writing unitcells or nor
+    cdef char with_unitcell    # used in mode='w' to know if we're writing unitcells or nor
     cdef readonly char* distance_unit
-
+    cdef np.ndarray _offsets
+    cdef int has_velocities
+    cdef int has_forces
 
     def __cinit__(self, char* filename, char* mode='r', force_overwrite=True, **kwargs):
         """Open a GROMACS TRR file for reading/writing.
@@ -215,6 +213,7 @@ cdef class TRRTrajectoryFile:
         self.frame_counter = 0
         self.n_frames = -1
         self.filename = filename
+        self._offsets = None
 
         if str(mode) == 'r':
             self.n_atoms = 0
@@ -228,15 +227,25 @@ cdef class TRRTrajectoryFile:
             self.fh = trrlib.xdrfile_open(filename, b'r')
             if self.fh is NULL:
                 raise IOError('File not found: "%s"' % filename)
+
+            # check for velocities/forces; store number found
+            self.has_velocities = -1
+            self.has_forces = -1
+            self.has_velocities, self.has_forces = self._check_has_velocities_forces()
+            if self.has_velocities < 0 or self.has_forces < 0:
+                raise RuntimeError("Could not determine whether velocities"
+                                   " or forces are present!")
+
             self.approx_n_frames = self._estimate_n_frames_from_filesize(os.stat(filename).st_size)
 
             self.min_chunk_size = max(kwargs.pop('min_chunk_size', 100), 1)
             self.chunk_size_multiplier = max(kwargs.pop('chunk_size_multiplier', 1.5), 0.01)
 
-
         elif str(mode) == 'w':
             if force_overwrite and os.path.exists(filename):
                 os.unlink(filename)
+            if not force_overwrite and os.path.exists(filename):
+                raise IOError('"%s" already exists' % filename)
 
             self.fh = trrlib.xdrfile_open(filename, 'w')
             if self.fh is NULL:
@@ -251,11 +260,43 @@ cdef class TRRTrajectoryFile:
         self.is_open = True
         self.mode = mode
 
+    def _check_has_velocities_forces(self):
+        # return values are nonzero if the file contains velocities/forces
+        cdef trrlib.t_trnheader header
+        cdef int frame_size, header_size
+        cdef int64_t n_frames, old_pos
+
+        old_pos = xdrlib.xdr_tell(self.fh)
+        try:
+            xdrlib.xdr_seek(self.fh, 0, SEEK_SET)
+            if trrlib.do_trnheader(self.fh, 1, &header) != 0:
+                raise RuntimeError("could not read header of first frame!")
+        finally:
+            xdrlib.xdr_seek(self.fh, old_pos, SEEK_SET)
+
+        has_velocities = header.v_size
+        has_forces = header.f_size
+        return has_velocities, has_forces
+
     def _estimate_n_frames_from_filesize(self, filesize):
-        # this approximation is pretty bad. on 5000/500 frames, 50/100 atoms,
-        # it seems to be about 30%
-        approx_n_frames = filesize / ((self.n_atoms * 2 * + 16) / 2)
-        return approx_n_frames
+        # read the first header, sum the size of all data fields and extrapolate.
+        cdef trrlib.t_trnheader header
+        cdef int frame_size, header_size
+        cdef int64_t n_frames, old_pos
+
+        old_pos = xdrlib.xdr_tell(self.fh)
+        try:
+            xdrlib.xdr_seek(self.fh, 0, SEEK_SET)
+            if trrlib.do_trnheader(self.fh, 1, &header) != 0:
+                raise RuntimeError("could not read header of first frame!")
+        finally:
+            xdrlib.xdr_seek(self.fh, old_pos, SEEK_SET)
+
+        header_size = xdrlib.xdr_tell(self.fh)
+        frame_size = sum((<int*> &header)[i] for i in range(1, 11))
+        n_frames = filesize / (frame_size + header_size)
+
+        return n_frames
 
     def __dealloc__(self):
         self.close()
@@ -265,6 +306,50 @@ cdef class TRRTrajectoryFile:
         if self.is_open:
             trrlib.xdrfile_close(self.fh)
             self.is_open = False
+
+    def read_as_traj(self, topology, n_frames=None, stride=None, atom_indices=None):
+        """read_as_traj(topology, n_frames=None, stride=None, atom_indices=None)
+
+        Read a trajectory from an XTC file
+
+        Parameters
+        ----------
+        topology : Topology
+            The system topology
+        n_frames : int, None
+            The number of frames you would like to read from the file.
+            If None, all of the remaining frames will be loaded.
+        stride : int, optional
+            Read only every stride-th frame.
+        atom_indices : array_like, optional
+            If not none, then read only a subset of the atoms coordinates from the
+            file. This may be slightly slower than the standard read because it required
+            an extra copy, but will save memory.
+
+        Returns
+        -------
+        trajectory : Trajectory
+            A trajectory object containing the loaded portion of the file.
+
+        See Also
+        --------
+        read : Returns the raw data from the file
+        """
+
+        from mdtraj.core.trajectory import Trajectory
+        if atom_indices is not None:
+            topology = topology.subset(atom_indices)
+
+        xyz, time, step, box, _ = self.read(n_frames=n_frames, stride=stride, atom_indices=atom_indices)
+        if len(xyz) == 0:
+            return Trajectory(xyz=np.zeros((0, topology.n_atoms, 3)), topology=topology)
+
+        in_units_of(xyz, self.distance_unit, Trajectory._distance_unit, inplace=True)
+        in_units_of(box, self.distance_unit, Trajectory._distance_unit, inplace=True)
+
+        trajectory = Trajectory(xyz=xyz, topology=topology, time=time)
+        trajectory.unitcell_vectors = box
+        return trajectory
 
     def read(self, n_frames=None, stride=None, atom_indices=None):
         """read(n_frames=None, stride=None, atom_indices=None)
@@ -300,19 +385,38 @@ cdef class TRRTrajectoryFile:
         -----
         The TRR format DOES support saving velocities and forces, but those
         fields are not read (or written) by the current implementation of this
-        wrapper.
+        wrapper. However, this functionality is accessible in the internal
+        TRRTrajectoryFile._read()/._write() methods.
         """
         if not str(self.mode) == 'r':
             raise ValueError('read() is only available when file is opened in mode="r"')
         if not self.is_open:
             raise IOError('file must be open to read from it.')
 
+        stride = int(stride) if stride is not None else 1
+
         if n_frames is not None:
             # if they supply the number of frames they want, that's easy
             if not int(n_frames) == n_frames:
                 raise ValueError('n_frames must be an int, you supplied "%s"' % n_frames)
-            xyz, time, step, box, lambd = self._read(int(n_frames), atom_indices)
-            xyz, time, step, box, lambd = xyz[::stride], time[::stride], step[::stride], box[::stride], lambd[::stride]
+            # vel and forces will be `None` here, but must be unpacked
+            if stride > 1 and self._offsets is not None:
+                xyz, time, step, box, lambd, vel, forces = \
+                    self._read_with_stride(int(n_frames), atom_indices, stride)
+            else:
+                xyz, time, step, box, lambd, vel, forces = \
+                    self._read(int(n_frames) * stride, atom_indices)
+                xyz, time, step, box, lambd = (xyz[::stride], time[::stride],
+                                               step[::stride], box[::stride],
+                                               lambd[::stride])
+            if np.all(np.logical_and(box < 1e-10, box > -1e-10)):
+                box = None
+            return xyz, time, step, box, lambd
+
+        if stride > 1 and self._offsets is not None:
+            n_frames = len(self._offsets)
+            xyz, time, step, box, lambd, vel, forces = \
+                self._read_with_stride(n_frames, atom_indices, stride)
             if np.all(np.logical_and(box < 1e-10, box > -1e-10)):
                 box = None
             return xyz, time, step, box, lambd
@@ -326,7 +430,9 @@ cdef class TRRTrajectoryFile:
             # think are in the file and how many we've currently read
             chunk = max(abs(int((self.approx_n_frames - self.frame_counter) * self.chunk_size_multiplier)),
                         self.min_chunk_size)
-            xyz, time, step, box, lambd = self._read(chunk, atom_indices)
+
+            xyz, time, step, box, lambd, vel, forces = \
+                    self._read(chunk, atom_indices)
             if len(xyz) <= 0:
                 break
 
@@ -345,12 +451,19 @@ cdef class TRRTrajectoryFile:
             all_box = None
         return all_xyz, all_time, all_step, all_box, all_lambd
 
-    def _read(self, int n_frames, atom_indices):
+    def _read(self, int64_t n_frames, atom_indices,
+              bint get_velocities=False, get_forces=False):
         """Read a specified number of TRR frames from the buffer"""
 
-        cdef int i = 0
+        cdef int64_t i = 0
         cdef int status = _EXDROK
         cdef int n_atoms_to_read
+
+        # check that velocities/forces are present if requested
+        if get_velocities and self.has_velocities == 0:
+            raise RuntimeError("Velocities requested, but none in file")
+        if get_forces and self.has_forces == 0:
+            raise RuntimeError("Forces requested, but none in file")
 
         if atom_indices is None:
             n_atoms_to_read = self.n_atoms
@@ -375,19 +488,57 @@ cdef class TRRTrajectoryFile:
         cdef np.ndarray[ndim=3, dtype=np.float32_t, mode='c'] box = \
             np.empty((n_frames, 3, 3), dtype=np.float32)
 
-        # only used if atom_indices is given
-        cdef np.ndarray[dtype=np.float32_t, ndim=2] framebuffer = np.zeros((self.n_atoms, 3), dtype=np.float32)
+        # only used if get_velocities/get_forces is True
+        cdef np.ndarray[ndim=3, dtype=np.float32_t, mode='c'] vel
+        cdef np.ndarray[ndim=3, dtype=np.float32_t, mode='c'] forces
 
+        # only used if atom_indices is given
+        cdef np.ndarray[dtype=np.float32_t, ndim=2] xyz_buffer
+        cdef np.ndarray[dtype=np.float32_t, ndim=2] vel_buffer
+        cdef np.ndarray[dtype=np.float32_t, ndim=2] forces_buffer
+        if atom_indices is not None:
+            xyz_buffer = np.zeros((self.n_atoms, 3), dtype=np.float32)
+            vel_buffer = np.zeros((self.n_atoms, 3), dtype=np.float32)
+            forces_buffer = np.zeros((self.n_atoms, 3), dtype=np.float32)
+
+        if get_velocities:
+            vel = np.empty((n_frames, n_atoms_to_read, 3), dtype=np.float32)
+        if get_forces:
+            forces = np.empty((n_frames, n_atoms_to_read, 3), dtype=np.float32)
 
 
         while (i < n_frames) and (status != _EXDRENDOFFILE):
             if atom_indices is None:
-                status = trrlib.read_trr(self.fh, self.n_atoms, <int*> &step[i], &time[i], &lambd[i],
-                                         <trrlib.matrix>&box[i,0,0], <trrlib.rvec*>&xyz[i,0,0], NULL, NULL)
+                frame_vel = NULL
+                if get_velocities:
+                    frame_vel = <trrlib.rvec*>&vel[i,0,0]
+                frame_forces = NULL
+                if get_forces:
+                    frame_forces = <trrlib.rvec*>&forces[i,0,0]
+                status = trrlib.read_trr(self.fh, self.n_atoms,
+                                         <int*> &step[i],
+                                         &time[i], &lambd[i],
+                                         <trrlib.matrix>&box[i,0,0],
+                                         <trrlib.rvec*>&xyz[i,0,0],
+                                         frame_vel, frame_forces)
             else:
-                status = trrlib.read_trr(self.fh, self.n_atoms, <int*> &step[i], &time[i], &lambd[i],
-                                         <trrlib.matrix> &box[i,0,0], <trrlib.rvec*>&framebuffer[0,0], NULL, NULL)
-                xyz[i, :, :] = framebuffer[atom_indices, :]
+                frame_vel = NULL
+                if get_velocities:
+                    frame_vel = <trrlib.rvec*>&vel_buffer[0,0]
+                frame_forces = NULL
+                if get_forces:
+                    frame_forces = <trrlib.rvec*>&forces_buffer[0,0]
+                status = trrlib.read_trr(self.fh, self.n_atoms,
+                                         <int*> &step[i],
+                                         &time[i], &lambd[i],
+                                         <trrlib.matrix> &box[i,0,0],
+                                         <trrlib.rvec*>&xyz_buffer[0,0],
+                                         frame_vel, frame_forces)
+                xyz[i, :, :] = xyz_buffer[atom_indices, :]
+                if get_velocities:
+                    vel[i, :, :] = vel_buffer[atom_indices, :]
+                if get_forces:
+                    forces[i, :, :] = forces_buffer[atom_indices, :]
 
             if status != _EXDRENDOFFILE and status != _EXDROK:
                 raise RuntimeError('TRR read error: %s' % _EXDR_ERROR_MESSAGES.get(status, 'unknown'))
@@ -399,10 +550,121 @@ cdef class TRRTrajectoryFile:
             time = time[:i-1]
             step = step[:i-1]
             lambd = lambd[:i-1]
+            if get_velocities:
+                vel = vel[:i-1]
+            if get_forces:
+                forces = forces[:i-1]
 
         self.frame_counter += i
 
-        return xyz, time, step, box, lambd
+        vel_return = vel if get_velocities else None
+        forces_return = forces if get_forces else None
+
+        return xyz, time, step, box, lambd, vel_return, forces_return
+
+    def _read_with_stride(self, int64_t n_frames, atom_indices, stride, bint get_velocities=False, get_forces=False):
+        assert self._offsets is not None
+        assert stride > 1
+        if n_frames > len(self):
+            n_frames = len(self)
+
+        # absolute positions
+        stride = np.arange(self.frame_counter, min(self.frame_counter + n_frames * stride, len(self)), stride)
+        n_frames = len(stride)
+
+        cdef int64_t i = 0
+        cdef int status = _EXDROK
+        cdef int n_atoms_to_read
+
+        # check that velocities/forces are present if requested
+        if get_velocities and self.has_velocities == 0:
+            raise RuntimeError("Velocities requested, but none in file")
+        if get_forces and self.has_forces == 0:
+            raise RuntimeError("Forces requested, but none in file")
+
+        if atom_indices is None:
+            n_atoms_to_read = self.n_atoms
+        elif isinstance(atom_indices, slice):
+            n_atoms_to_read = len(np.arange(self.n_atoms)[atom_indices])
+        else:
+            atom_indices = np.asarray(atom_indices)
+            if min(atom_indices) < 0:
+                raise ValueError('atom_indices should be zero indexed. you gave an index less than zero')
+            if max(atom_indices) >= self.n_atoms:
+                raise ValueError('atom indices should be zero indexed. you gave an index bigger than the number of atoms')
+            n_atoms_to_read = len(atom_indices)
+
+        cdef np.ndarray[ndim=3, dtype=np.float32_t, mode='c'] xyz = \
+            np.empty((n_frames, n_atoms_to_read, 3), dtype=np.float32)
+        cdef np.ndarray[ndim=1, dtype=np.float32_t, mode='c'] time = \
+            np.empty((n_frames), dtype=np.float32)
+        cdef np.ndarray[ndim=1, dtype=np.int32_t, mode='c'] step = \
+            np.empty((n_frames), dtype=np.int32)
+        cdef np.ndarray[ndim=1, dtype=np.float32_t, mode='c'] lambd = \
+            np.empty((n_frames), dtype=np.float32)
+        cdef np.ndarray[ndim=3, dtype=np.float32_t, mode='c'] box = \
+            np.empty((n_frames, 3, 3), dtype=np.float32)
+
+        # only used if get_velocities/get_forces is True
+        cdef np.ndarray[ndim=3, dtype=np.float32_t, mode='c'] vel
+        cdef np.ndarray[ndim=3, dtype=np.float32_t, mode='c'] forces
+
+        # only used if atom_indices is given
+        cdef np.ndarray[dtype=np.float32_t, ndim=2] xyz_buffer
+        cdef np.ndarray[dtype=np.float32_t, ndim=2] vel_buffer
+        cdef np.ndarray[dtype=np.float32_t, ndim=2] forces_buffer
+        if atom_indices is not None:
+            xyz_buffer = np.zeros((self.n_atoms, 3), dtype=np.float32)
+            vel_buffer = np.zeros((self.n_atoms, 3), dtype=np.float32)
+            forces_buffer = np.zeros((self.n_atoms, 3), dtype=np.float32)
+
+        if get_velocities:
+            vel = np.empty((n_frames, n_atoms_to_read, 3), dtype=np.float32)
+        if get_forces:
+            forces = np.empty((n_frames, n_atoms_to_read, 3), dtype=np.float32)
+
+        for i, frame_index in enumerate(stride):
+            self.seek(frame_index)
+            if atom_indices is None:
+                frame_vel = NULL
+                if get_velocities:
+                    frame_vel = <trrlib.rvec*>&vel[i,0,0]
+                frame_forces = NULL
+                if get_forces:
+                    frame_forces = <trrlib.rvec*>&forces[i,0,0]
+                status = trrlib.read_trr(self.fh, self.n_atoms,
+                                         <int*> &step[i],
+                                         &time[i], &lambd[i],
+                                         <trrlib.matrix>&box[i,0,0],
+                                         <trrlib.rvec*>&xyz[i,0,0],
+                                         frame_vel, frame_forces)
+            else:
+                frame_vel = NULL
+                if get_velocities:
+                    frame_vel = <trrlib.rvec*>&vel_buffer[0,0]
+                frame_forces = NULL
+                if get_forces:
+                    frame_forces = <trrlib.rvec*>&forces_buffer[0,0]
+                status = trrlib.read_trr(self.fh, self.n_atoms,
+                                         <int*> &step[i],
+                                         &time[i], &lambd[i],
+                                         <trrlib.matrix> &box[i,0,0],
+                                         <trrlib.rvec*>&xyz_buffer[0,0],
+                                         frame_vel, frame_forces)
+                xyz[i, :, :] = xyz_buffer[atom_indices, :]
+                if get_velocities:
+                    vel[i, :, :] = vel_buffer[atom_indices, :]
+                if get_forces:
+                    forces[i, :, :] = forces_buffer[atom_indices, :]
+
+            if status != _EXDRENDOFFILE and status != _EXDROK:
+                raise RuntimeError('TRR read error: %s' % _EXDR_ERROR_MESSAGES.get(status, 'unknown'))
+            self.frame_counter = frame_index  # set absolute position
+
+        vel_return = vel if get_velocities else None
+        forces_return = forces if get_forces else None
+
+        return xyz, time, step, box, lambd, vel_return, forces_return
 
     def write(self, xyz, time=None, step=None, box=None, lambd=None):
         """write(xyz, time=None, step=None, box=None, lambd=None)
@@ -473,11 +735,15 @@ cdef class TRRTrajectoryFile:
 
         self._write(xyz, time, step, box, lambd)
 
-    def _write(self, np.ndarray[ndim=3, dtype=np.float32_t, mode='c'] xyz not None,
+    def _write(self,
+               np.ndarray[ndim=3, dtype=np.float32_t, mode='c'] xyz not None,
                np.ndarray[ndim=1, dtype=np.float32_t, mode='c'] time not None,
                np.ndarray[ndim=1, dtype=np.int32_t, mode='c'] step not None,
                np.ndarray[ndim=3, dtype=np.float32_t, mode='c'] box not None,
-               np.ndarray[ndim=1, dtype=np.float32_t, mode='c'] lambd not None):
+               np.ndarray[ndim=1, dtype=np.float32_t, mode='c'] lambd not None,
+               np.ndarray[ndim=3, dtype=np.float32_t, mode='c'] vel=None,
+               np.ndarray[ndim=3, dtype=np.float32_t, mode='c'] forces=None
+              ):
 
         cdef int n_frames = len(xyz)
         cdef int n_atoms = xyz.shape[1]
@@ -486,9 +752,24 @@ cdef class TRRTrajectoryFile:
         # all same length
         assert n_frames == len(box) == len(step) == len(time) == len(lambd)
 
+        if vel is not None:
+            assert n_frames == len(vel)
+        if forces is not None:
+            assert n_frames == len(forces)
+
         for i in range(n_frames):
-            status = trrlib.write_trr(self.fh, n_atoms, step[i], time[i], lambd[i],
-                <trrlib.matrix>&box[i, 0, 0], <trrlib.rvec*>&xyz[i, 0, 0], NULL, NULL)
+            if vel is not None:
+                write_vel = <trrlib.rvec*>&vel[i, 0, 0]
+            else:
+                write_vel = NULL
+            if forces is not None:
+                write_forces = <trrlib.rvec*>&forces[i, 0, 0]
+            else:
+                write_forces = NULL
+            status = trrlib.write_trr(self.fh, n_atoms, step[i], time[i],
+                                      lambd[i], <trrlib.matrix>&box[i, 0, 0],
+                                      <trrlib.rvec*>&xyz[i, 0, 0],
+                                      write_vel, write_forces)
             if status != _EXDROK:
                 raise RuntimeError('TRR write error: %s' % status)
 
@@ -510,10 +791,8 @@ cdef class TRRTrajectoryFile:
             2: move relative to the end of file, offset should be <= 0.
             Seeking beyond the end of a file is not supported
         """
-        cdef int i, status, step
-        cdef float time, prec, lambd
-        cdef np.ndarray[dtype=np.float_t] box = np.empty(9, dtype=np.float)
-        cdef np.ndarray[dtype=np.float_t] xyz = np.empty(self.n_atoms * 3, dtype=np.float)
+        cdef int status
+        cdef int64_t pos
 
         if str(self.mode) != 'r':
             raise NotImplementedError('seek() only available in mode="r" currently')
@@ -526,14 +805,10 @@ cdef class TRRTrajectoryFile:
         else:
             raise IOError('Invalid argument')
 
-        trrlib.xdrfile_close(self.fh)
-        self.fh = trrlib.xdrfile_open(self.filename, self.mode)
-
-        for i in range(absolute):
-            status = trrlib.read_trr(self.fh, self.n_atoms, &step, &time,
-                &lambd, <trrlib.matrix>&box[0], <trrlib.rvec*>&xyz[0], NULL, NULL)
-            if status != _EXDROK:
-                raise RuntimeError('TRR seek error: %s' % status)
+        pos = self.offsets[absolute]
+        status = xdrlib.xdr_seek(self.fh, pos, SEEK_SET)
+        if status != 0:
+            raise RuntimeError('TRR seek error: %s' % status)
 
         self.frame_counter = absolute
 
@@ -548,6 +823,64 @@ cdef class TRRTrajectoryFile:
         if str(self.mode) != 'r':
             raise NotImplementedError('tell() only available in mode="r" currently')
         return int(self.frame_counter)
+
+    @property
+    def offsets(self):
+        """get byte offsets from current xtc file
+        See Also
+        --------
+        set_offsets
+        """
+        if self._offsets is None:
+            self.n_frames, self._offsets = self._calc_len_and_offsets()
+        return self._offsets
+
+    @offsets.setter
+    def offsets(self, offsets):
+        """set frame offsets"""
+        self._offsets = offsets
+
+    def _calc_len_and_offsets(self):
+        """read byte offsets from TRR file directly"""
+        cdef int status, i, frame_size, frame_offset, header_size
+        cdef int64_t file_size
+        cdef unsigned long n_frames
+        cdef np.ndarray[ndim=1, dtype=np.npy_int64] offsets
+        cdef trrlib.t_trnheader header
+
+        import os
+        file_size = os.stat(self.filename).st_size
+        cdef int64_t old_pos = xdrlib.xdr_tell(self.fh)
+
+        try:
+            xdrlib.xdr_seek(self.fh, 0, SEEK_SET)
+            if trrlib.do_trnheader(self.fh, 1, &header) != 0:
+                raise RuntimeError("could not read header of first frame!")
+            header_size = xdrlib.xdr_tell(self.fh)
+            frame_size = sum((<int*> &header)[i] for i in range(1, 11))
+
+            size = file_size / (frame_size + header_size)
+            offsets = np.empty(size, dtype=np.int64)
+            n_frames = 1
+            offsets[0] = 0
+
+            while True:
+                status = xdrlib.xdr_seek(self.fh, frame_size, SEEK_CUR)
+                if status != 0:
+                    raise RuntimeError("could not seek...")
+                frame_offset = xdrlib.xdr_tell(self.fh)
+                if trrlib.do_trnheader(self.fh, 1, &header) != 0:
+                    break
+
+                frame_size = sum((<int*> &header)[i] for i in range(1, 11))
+                if n_frames == len(offsets):
+                    offsets = np.resize(offsets, int(len(offsets)*1.2))
+                offsets[n_frames] = frame_offset
+                n_frames += 1
+        finally:
+            xdrlib.xdr_seek(self.fh, old_pos, SEEK_SET)
+
+        return n_frames, offsets[:n_frames]
 
     def __enter__(self):
         "Support the context manager protocol"
@@ -564,6 +897,7 @@ cdef class TRRTrajectoryFile:
         if not self.is_open:
             raise ValueError('I/O operation on closed file')
         if self.n_frames == -1:
-            trrlib.read_trr_nframes(self.filename, &self.n_frames)
+            self.offsets
         return int(self.n_frames)
-_FormatRegistry.register_fileobject('.trr')(TRRTrajectoryFile)
+
+FormatRegistry.register_fileobject('.trr')(TRRTrajectoryFile)
